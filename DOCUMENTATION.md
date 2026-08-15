@@ -107,8 +107,8 @@ Three ways, in order of precedence:
 `--list` shows everything found and whether it can actually be opened:
 
 ```
-  Photothèque.photoslibrary    readable  923.2 MiB
-                               /Volumes/Disk/Photothèque.photoslibrary
+  Vacation.photoslibrary       readable  412.6 MiB
+                               /Volumes/Disk/Vacation.photoslibrary
   Family.photoslibrary         BLOCKED (needs Full Disk Access)
                                /Users/you/Pictures/Family.photoslibrary
 ```
