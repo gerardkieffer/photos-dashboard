@@ -15,12 +15,40 @@ Then open <http://localhost:8787/>.
 Python standard library only — no pip install, no CDN, no build step. The page is
 served by the same process that does the sampling.
 
-## Read-only
+## Read-only, and proved so
 
-Every connection is opened `mode=ro`, nothing writes to the library, and no lock is
-taken. It is safe to leave running while Photos.app is open and while the analysis
-daemons are working. The only side effects are outside the bundle: the time-series
-file under `snapshots/dashboard/`, and the `log show` / `lsof` / `pgrep` subprocesses.
+Integrity of the library matters more than anything this tool reports, so read-only
+is enforced three independent ways rather than trusted once:
+
+1. the file handle is opened `mode=ro`, so the OS refuses writes;
+2. the connection runs under `PRAGMA query_only`;
+3. a SQLite **authorizer** rejects every non-read action before a statement is even
+   compiled — `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, and every pragma
+   outside a read-only whitelist.
+
+All three have to be removed on purpose. `./bin/test_readonly.py` is an executable
+proof rather than a claim in a comment: it checks each guard rejects a write, then
+clones a real library into a scratch bundle nothing else has open, SHA-256s every
+file, runs every collector, and re-hashes — comparing content, size, mtime and inode.
+
+```sh
+./bin/test_readonly.py
+```
+
+**Direct mode leaves `Photos.sqlite` and its WAL byte-identical.** One honest caveat,
+measured rather than assumed: SQLite does update the `-shm` file. That is the
+WAL-index — a derived scratch file holding no library data, regenerated from the WAL
+whenever missing, which *every* reader of a WAL database updates with its read-mark,
+Photos itself included.
+
+**`--snapshot-mode` avoids even that.** It copies `Photos.sqlite` + `-wal` + `-shm`
+aside and reads the copy, so not one byte inside the bundle is written — the test
+asserts exactly that. Where the scratch directory is on the same APFS volume the copy
+is a clone: no data moved, no extra space used. The cost is freshness, since live
+metrics are only as current as `--snapshot-interval` (default 60 s).
+
+Nothing else touches the bundle. Side effects are all outside it: the time-series file
+under `snapshots/dashboard/`, and the `log show` / `lsof` / `pgrep` subprocesses.
 
 ## What it shows
 
@@ -57,7 +85,30 @@ walk is tens of thousands of `stat` calls; disable it with `--no-fs-walk`.
 
 History lives in `snapshots/dashboard/<library>-<inode>.db`, one file per library.
 Keyed by inode because two library paths can look alike, and because a shared store
-would interleave two libraries' series under the same metric names.
+would interleave two libraries' series under the same metric names. The file persists
+across restarts, so charts keep their history when the server is stopped and started.
+
+## Choosing a library
+
+Three ways, in order of precedence:
+
+```sh
+./bin/photo_dashboard.py --list                     # what is readable, and what macOS blocks
+./bin/photo_dashboard.py --library "/Volumes/Disk/X.photoslibrary"
+./bin/photo_dashboard.py                            # auto: readable first, then largest
+```
+
+The library can also be **switched at runtime** from the picker in the page header,
+which swaps the sampler, the history file and the snapshot directory together. Only
+libraries that discovery already found can be selected, so the endpoint cannot be used
+to point the server at an arbitrary path.
+
+## Explaining the numbers
+
+Most panels carry an ⓘ that explains the underlying mechanism in plain language, and
+a **Reference** section lists the background workers Photos runs plus the code values
+seen in your library. The rule throughout is the one the internals document uses: say
+what was measured, and say plainly when something is not established.
 
 ## Things worth knowing
 
@@ -75,9 +126,17 @@ whose `ZTIMESTAMP` falls in the interval. It is labelled as derived on the page.
 The nearest thing to a real completion record is the per-worker analysis coverage
 panel, which counts assets whose version column for that worker is non-zero.
 
-**Job type and flag meanings are not established.** `ZJOBFLAGS` is a bitmask — every
-observed value decomposes into powers of two — so the dashboard shows the bits and
-declines to invent names for them.
+**Job type and flag meanings are mostly not established.** `ZJOBFLAGS` is a bitmask —
+every observed value decomposes into powers of two — so the dashboard shows the bits
+and declines to invent names for them. One job type *is* settled by direct evidence:
+type 11 is cascade donation, since all 681 rows of that type carry the literal
+identifier `PLCascadeDonationRequired`, naming
+`PLBackgroundJobCascadeDonationWorker`.
+
+The Reference section also lists the background workers Photos runs, read from the
+Objective-C class list of Apple's `PhotoLibraryServices` framework. Those names are
+real, but which worker a given `ZJOBTYPE` routes to is not established, so the list is
+presented as a catalogue of the work Photos does — not as a decoder for the numbers.
 
 ## Notes measured while building this
 
@@ -107,10 +166,11 @@ Three things that go beyond what the internals document records:
 
 ```
 bin/photo_dashboard.py        entry point / CLI
+bin/test_readonly.py          executable proof that nothing is written
 bin/photodash/collectors.py   every read of the library, one function per concern
 bin/photodash/history.py      tiered time-series store, rollups and retention
 bin/photodash/server.py       sampler thread + JSON API + static file serving
-bin/photodash/static/         index.html, app.js, style.css
+bin/photodash/static/         index.html, app.js, glossary.js, style.css
 ```
 
 Section references throughout the code are to `APPLE-PHOTOS-LIBRARY-INTERNALS.md`.
