@@ -25,6 +25,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import collectors as C
+from . import docs
 from .history import TIERS, History
 
 STATIC = Path(__file__).resolve().parent / "static"
@@ -62,6 +63,8 @@ class Sampler(threading.Thread):
         with self.lock:
             self.state[key] = value
             self.state["status"] = "ok"
+            self.state.pop("status_detail", None)
+            self.state.pop("status_help", None)
             self.state["updated_at"] = time.time()
 
     def _note(self, msg: str) -> None:
@@ -267,7 +270,8 @@ class Sampler(threading.Thread):
             if procs["unattended"] and not prev.get("unattended"):
                 self.history.add_event(
                     "processes", "warn",
-                    "nothing holds this library — no background processing will happen")
+                    "nothing holds this library — no background processing will happen. "
+                    f"See {docs.DOCUMENTATION}: {docs.TOPICS['unattended'][0]}")
             if not procs["unattended"] and prev.get("unattended"):
                 self.history.add_event("processes", "info",
                                        "daemons attached to the library again")
@@ -309,7 +313,8 @@ class Sampler(threading.Thread):
                     self.history.add_event(
                         "integrity", "error",
                         f"{data['constraint_violations']} persistent-history constraint "
-                        f"violations in the last {self.log_minutes}m — see §3.2")
+                        f"violations in the last {self.log_minutes}m. "
+                        f"See {docs.DOCUMENTATION}: {docs.TOPICS['pk-fault'][0]}")
             except Exception as exc:                          # noqa: BLE001
                 self._note(f"log collector: {exc}")
             self.stop_event.wait(self.log_interval)
@@ -346,6 +351,7 @@ class Sampler(threading.Thread):
                     with self.lock:
                         self.state["status"] = "library unavailable"
                         self.state["status_detail"] = str(exc)
+                        self.state["status_help"] = docs.web("unavailable")
                     self._note(f"open: {exc}")
                     # An unmounted external volume is the common case; back off
                     # rather than hammering it.
@@ -542,6 +548,8 @@ class Handler(BaseHTTPRequestHandler):
                     "libraries": self.sup.discover(),
                     "current": current,
                 })
+            if path == "/api/docs":
+                return self._json({"topics": docs.all_topics()})
             if path == "/api/health":
                 snap = self.sup.snapshot()
                 return self._json({"status": snap.get("status"),
@@ -607,6 +615,7 @@ def serve(library: Path, history_for, host: str, port: int,
         print("  access    direct read-only — Photos.sqlite and its WAL are never")
         print("            written; SQLite may update the -shm WAL-index scratch")
         print("            file. Use --snapshot-mode to avoid even that.")
+        print(docs.cli("readonly"))
     print(f"  dashboard http://{host if host != '0.0.0.0' else 'localhost'}:{port}/")
     print("  Ctrl-C to stop")
     try:

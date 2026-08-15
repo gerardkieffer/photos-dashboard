@@ -38,8 +38,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import phlib as ph
 from photodash import collectors as C
+from photodash import coredata as ph
+from photodash import docs
 from photodash.server import serve
 
 
@@ -49,18 +50,22 @@ def pick_library(explicit: Path | None) -> Path:
         if not C.readable(lib):
             ph.eprint(f"ERROR: cannot read {lib}")
             ph.eprint("  Either there is no library there, or macOS is blocking it.")
-            ph.eprint("  Libraries under ~ need Full Disk Access (internals doc §17);")
+            ph.eprint("  A library under your home directory needs Full Disk Access;")
             ph.eprint("  one on an external volume needs no permission at all.")
+            ph.eprint(docs.cli("blocked"))
             raise SystemExit(2)
         return lib
     readable = [e for e in C.discover_libraries() if e["readable"]]
     if not readable:
-        ph.eprint("ERROR: no readable Photos library found. Try --list.")
+        ph.eprint("ERROR: no readable Photos library found.")
+        ph.eprint("  Run with --list to see what was found and what macOS is blocking.")
+        ph.eprint(docs.cli("no-library"))
         raise SystemExit(2)
     if len(readable) > 1:
         others = ", ".join(e["name"] for e in readable[1:])
         ph.eprint(f"note: {len(readable)} readable libraries found; watching the largest.")
         ph.eprint(f"      also available (use --library): {others}")
+        ph.eprint(docs.cli("choosing"))
     return Path(readable[0]["path"])
 
 
@@ -80,20 +85,24 @@ def history_path_for(lib: Path, explicit: Path | None) -> Path:
     except OSError:
         inode = 0
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", lib.stem)[:48]
-    return ph.WORKDIR / "snapshots" / "dashboard" / f"{safe}-{inode}.db"
+    return ph.PROJECT_DIR / "snapshots" / "dashboard" / f"{safe}-{inode}.db"
 
 
 def cmd_list() -> int:
     libs = C.discover_libraries()
     if not libs:
         print("no *.photoslibrary bundles found")
+        print(docs.cli("no-library"))
         return 1
     width = max(len(l["name"]) for l in libs)
     for l in libs:
-        mark = "readable" if l["readable"] else "BLOCKED (needs Full Disk Access, §17)"
+        mark = "readable" if l["readable"] else "BLOCKED (needs Full Disk Access)"
         size = f'  {C.human(l["db_bytes"])}' if l.get("db_bytes") else ""
         print(f'  {l["name"]:<{width}}  {mark}{size}')
         print(f'  {"":<{width}}  {l["path"]}')
+    if any(not l["readable"] for l in libs):
+        print()
+        print(docs.cli("blocked"))
     return 0
 
 

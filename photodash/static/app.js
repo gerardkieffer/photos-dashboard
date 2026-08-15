@@ -408,40 +408,83 @@ function render(s) {
   renderDiag(s);
 }
 
+/* Doc pointers, fetched once from /api/docs so the wording lives in one place
+ * (photodash/docs.py) and cannot drift between the terminal and the browser. */
+let DOCS = {};
+async function loadDocs() {
+  try { DOCS = (await (await fetch('/api/docs')).json()).topics || {}; } catch {}
+}
+
+function docLink(key) {
+  const t = DOCS[key];
+  if (!t) return null;
+  const wrap = el('div', 'doc-ref');
+  wrap.appendChild(el('span', '', 'Read more: '));
+  wrap.appendChild(el('b', '', `${t.doc} → ${t.anchor.replace(/\s*>\s*/g, ' → ')}`));
+  if (t.internals) {
+    wrap.appendChild(document.createTextNode('  ·  background: '));
+    wrap.appendChild(el('b', '', t.internals));
+  }
+  return wrap;
+}
+
+function banner(host, kind, html, docKey) {
+  const b = el('div', 'banner ' + kind);
+  const body = el('div');
+  body.innerHTML = html;
+  const link = docKey && docLink(docKey);
+  if (link) body.appendChild(link);
+  b.appendChild(body);
+  host.appendChild(b);
+}
+
 function renderBanners(s) {
   const host = $('#banners');
   host.innerHTML = '';
+
+  if (s.status && s.status !== 'ok') {
+    banner(host, 'err',
+      `<b>${s.status}.</b> ${s.status_detail ? `<code>${s.status_detail}</code>` : ''} ` +
+      `The dashboard keeps showing the last successful sample until it can read again.`,
+      'unavailable');
+  }
   const pk = s.pk_health;
   if (pk && pk.faults && pk.faults.length) {
-    const b = el('div', 'banner err');
     const names = pk.faults.map(f => `${f.table} (MAX(Z_PK)=${f.max_pk} > Z_MAX=${f.z_max})`).join(', ');
-    b.innerHTML = `<b>Primary-key counter behind.</b> Photos cannot save, and background ` +
-      `analysis writes will fail silently: ${names}. ` +
-      `<code>PRAGMA integrity_check</code> returns <code>ok</code> in this state, so it cannot ` +
-      `rule the problem out. See internals doc §3.2 and §20.2.`;
-    host.appendChild(b);
+    banner(host, 'err',
+      `<b>Primary-key counter behind.</b> Photos cannot save, and background analysis writes ` +
+      `will fail silently: ${names}. <code>PRAGMA integrity_check</code> returns <code>ok</code> ` +
+      `in this state, so it cannot rule the problem out.`, 'pk-fault');
   }
   if (s.log && s.log.constraint_violations > 0) {
-    const b = el('div', 'banner err');
-    b.innerHTML = `<b>${s.log.constraint_violations} persistent-history constraint violations</b> ` +
-      `in the last ${s.log.window_minutes} minutes of the unified log — the signature of a ` +
-      `counter that has fallen behind its table (§3.2).`;
-    host.appendChild(b);
+    banner(host, 'err',
+      `<b>${s.log.constraint_violations} persistent-history constraint violations</b> in the ` +
+      `last ${s.log.window_minutes} minutes of the unified log — the signature of a counter ` +
+      `that has fallen behind its table.`, 'pk-fault');
   }
   if (s.processes && s.processes.unattended) {
-    const b = el('div', 'banner warn');
-    b.innerHTML = `<b>Nothing holds this library.</b> No daemon has it open, so no background ` +
-      `analysis or indexing is happening. A secondary library only advances while Photos.app is ` +
-      `open on it; a promoted System Photo Library is held permanently (§2.5).`;
-    host.appendChild(b);
+    banner(host, 'warn',
+      `<b>Nothing holds this library.</b> No daemon has it open, so no background analysis or ` +
+      `indexing is happening. A secondary library only advances while Photos.app is open on it; ` +
+      `a promoted System Photo Library is held permanently.`, 'unattended');
   }
   if (s.log && s.log.throttle_state === 'fully throttled') {
-    const b = el('div', 'banner warn');
-    b.innerHTML = `<b>Analysis is fully throttled.</b> Every scheduler verdict in the last ` +
+    banner(host, 'warn',
+      `<b>Analysis is fully throttled.</b> Every scheduler verdict in the last ` +
       `${s.log.window_minutes} minutes was <i>May Not Proceed</i>. The heavy policy is ` +
       `<i>Device Activity</i>: it will not run while the Mac is in use. Leave the machine idle, ` +
-      `on mains power, and prevent sleep (§2.5).`;
-    host.appendChild(b);
+      `on mains power, and prevent sleep.`, 'throttled');
+  }
+  if (s.access && s.access.error) {
+    banner(host, 'err',
+      `<b>Snapshot copy failed.</b> <code>${s.access.error}</code>`, 'snapshot');
+  }
+  const errs = s.sampler && s.sampler.errors;
+  if (errs && errs.length) {
+    banner(host, 'warn',
+      `<b>${errs.length} collector error${errs.length > 1 ? 's' : ''}.</b> ` +
+      `Some panels may be stale — the most recent is <code>${errs[errs.length - 1]}</code>.`,
+      'diagnostics');
   }
 }
 
@@ -1022,6 +1065,7 @@ let paused = false;
 document.addEventListener('visibilitychange', () => { paused = document.hidden; });
 
 async function boot() {
+  await loadDocs();
   initCharts();
   initLibraryPicker();
   renderWorkerReference();

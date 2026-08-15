@@ -33,8 +33,8 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import phlib as ph
 from photodash import collectors as C
+from photodash import coredata as ph
 
 GREEN, RED, DIM, OFF = "\033[32m", "\033[31m", "\033[2m", "\033[0m"
 failures = 0

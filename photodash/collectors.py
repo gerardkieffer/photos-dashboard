@@ -20,7 +20,7 @@ The rules that shape this file:
   * §2.2  Z_ENT numbers are not stable. Everything is resolved at runtime, in
           the same process that uses it. Nothing is cached across restarts.
   * §2.3  Join-table names embed entity numbers; match on the word, not the
-          number (phlib.resolve_*_join does this).
+          number (coredata.resolve_*_join does this).
   * §5    Core Data timestamps are seconds since 2001-01-01 UTC.
   * §16   Compare text NFC-normalised; psi.sqlite strings are NUL-terminated
           (§19) so they need rstrip('\\x00') too.
@@ -42,8 +42,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import phlib as ph  # noqa: E402
+from . import coredata as ph
 
 APPLE_EPOCH = ph.APPLE_EPOCH
 LOG = "/usr/bin/log"          # §20: bare `log` hits a zsh builtin
@@ -148,7 +147,7 @@ def discover_libraries(deep: bool = True) -> list[dict]:
     promise that the library is never written.
     """
     seen: dict[str, dict] = {}
-    roots = [ph.WORKDIR, Path.home() / "Pictures"]
+    roots = [ph.PROJECT_DIR, ph.PROJECT_DIR.parent, Path.home() / "Pictures"]
     roots += [p for p in Path("/Volumes").glob("*") if p.is_dir()]
     for root in roots:
         try:
@@ -706,7 +705,7 @@ def collect_albums(con) -> dict:
         table, alb_col, ast_col = ph.resolve_album_join(con)
         out["album_memberships"] = scalar(con, f"SELECT COUNT(*) FROM {table}", default=0)
         out["album_join_table"] = table
-    except SystemExit:
+    except LookupError:
         pass
     return out
 
@@ -723,7 +722,7 @@ def collect_keywords(con) -> dict:
         out["assets_tagged"] = scalar(con, f"""
             SELECT COUNT(DISTINCT aa.ZASSET) FROM {table} j
               JOIN ZADDITIONALASSETATTRIBUTES aa ON aa.Z_PK = j.{attr_col}""", default=0)
-    except SystemExit:
+    except LookupError:
         pass
     return out
 
@@ -731,7 +730,7 @@ def collect_keywords(con) -> dict:
 def collect_top_keywords(con, limit: int = 15) -> list[dict]:
     try:
         table, attr_col, kw_col = ph.resolve_keyword_join(con)
-    except SystemExit:
+    except LookupError:
         return []
     out = []
     try:
