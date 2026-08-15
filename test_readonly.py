@@ -2,7 +2,7 @@
 """Prove the dashboard cannot modify a Photos library.
 
 Integrity of the library matters more than anything the dashboard reports, so
-this is an executable proof rather than a claim in a comment. It does three
+this is an executable test rather than a claim in a comment. It does three
 independent things:
 
   1. ENFORCEMENT — checks that each of the three read-only guards actually

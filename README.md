@@ -50,7 +50,7 @@ macOS, Python 3.10+, a browser. **No dependencies** — standard library only, n
 ## Quick start
 
 ```bash
-git clone https://github.com/<you>/photos-dashboard.git
+git clone https://github.com/gerardkieffer/photos-dashboard.git
 cd photos-dashboard
 python3 photo_dashboard.py --list
 python3 photo_dashboard.py
@@ -72,7 +72,7 @@ read-only is **enforced three independent ways**, not promised once:
 3. a **SQLite authorizer** that rejects every non-read action inside SQLite, before a
    statement is even compiled
 
-And it ships with an executable proof rather than a claim:
+And it ships with an executable test:
 
 ```bash
 python3 test_readonly.py
@@ -84,16 +84,16 @@ inode**.
 
 **Direct mode leaves `Photos.sqlite` and its WAL byte-identical.** One honest caveat:
 SQLite does update the `-shm` file, the WAL index — a derived scratch file holding no
-library data that *every* reader of a WAL database touches, Photos included.
+library data that *every* reader of a WAL database touches.
 
 **`--snapshot-mode` avoids even that**, reading a copy so nothing inside the bundle is
-written. On the same APFS volume the copy is a clone: a 923 MB library "copies" in
-0.27 s using no extra space.
+written. On the same APFS volume the copy is a clone: a 1 GB library "copies" in
+less than a second using nearly no extra space.
 
 ## Screenshot
+Display [full size screenshot of dashboard](screenshot-full-height.png)
 
-Run it and see — the dashboard renders live data from your own library, so a screenshot
-here would only show someone else's photo counts.
+![Screenshot](screenshot-thumbnail.png)
 
 ## Documentation
 

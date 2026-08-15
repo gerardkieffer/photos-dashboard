@@ -3,14 +3,13 @@
 > **Note on this copy.** This is the technical reference the dashboard's
 > collectors are built from, included here because the code and its error
 > messages cite its section numbers. It is identical to the original except that
-> the person names and the one place name used as worked examples have been
-> replaced with invented ones, so the document can be published. The replacements
+> the names and places have been replaced with invented ones,
+> so the document can be published. The replacements
 > preserve each example's point: the variant-spelling names still show an accent
 > dropped, a surname respelled, and a first name against a full name; the
 > NFC/NFD name still begins with the same two characters as the byte sequences
 > quoted beside it; and the time zone is still one at +02:00, matching the
-> `ZTIMEZONEOFFSET` value shown. All measurements, counts and queries are
-> unchanged.
+> `ZTIMEZONEOFFSET` value shown.
 
 
 Everything below was **measured directly**, against real libraries. Nothing here is recalled from

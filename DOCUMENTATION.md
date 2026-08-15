@@ -44,7 +44,7 @@ on an external disk needs no permission and is the easiest place to start (§17)
 There is nothing to install. Copy the folder anywhere and run it:
 
 ```bash
-git clone <your-fork-url> photos-dashboard
+git clone https://github.com/gerardkieffer/photos-dashboard.git
 cd photos-dashboard
 python3 photo_dashboard.py --list
 ```
@@ -141,7 +141,7 @@ false, and it would produce silently stale or torn reads.
 
 ### Verifying it yourself
 
-`test_readonly.py` is an executable proof rather than a claim in a comment:
+`test_readonly.py` is an executable test rather than a claim in a comment:
 
 ```bash
 python3 test_readonly.py
@@ -207,9 +207,9 @@ a permission check rather than an open.
 **Cost.** All three files are copied together — copying `Photos.sqlite` alone silently
 loses everything still in the WAL, which can be megabytes of recent edits (§2.4). Where
 the scratch directory is on the same APFS volume as the library, `cp -c` makes a clone
-instead: blocks are shared, nothing is duplicated, and it is effectively free. Measured
-on a 923 MB library, a clone took **0.27 s**. On a different volume it is a real copy
-and correspondingly slower.
+instead: blocks are shared, nothing is duplicated, and it is effectively free. A 1 GB
+library "copies" in less than a second using nearly no extra space. On a different
+volume it is a real copy and correspondingly slower.
 
 **Freshness.** Live metrics are only as current as `--snapshot-interval` (default 60 s),
 so the queue chart becomes minute-resolution rather than ten-second. The header badge
