@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Photos library dashboard</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>📊</text></svg>">
+</head>
+<body>
+
+<header class="top">
+  <div class="libpick" id="libpick">
+    <button type="button" id="libpick-btn" aria-haspopup="true" aria-expanded="false">
+      <span class="brand">
+        <span class="name" id="lib-name">…</span>
+        <span class="path" id="lib-path"></span>
+      </span>
+      <span class="caret">▼</span>
+    </button>
+    <div class="menu" id="libpick-menu" role="menu"></div>
+  </div>
+  <div class="status"><span class="dot" id="status-dot"></span><span id="status-text">connecting…</span></div>
+  <span class="pill dim" id="access-mode" data-help="access"></span>
+  <div class="spacer"></div>
+  <div class="top-facts">
+    <div class="top-fact">schema<b id="fact-schema">–</b></div>
+    <div class="top-fact">Photos.sqlite<b id="fact-db">–</b></div>
+    <div class="top-fact">WAL<b id="fact-wal">–</b></div>
+    <div class="top-fact">inode<b id="fact-inode">–</b></div>
+    <div class="top-fact">watching<b id="fact-uptime">–</b></div>
+  </div>
+</header>
+
+<main>
+  <div id="banners"></div>
+
+  <section>
+    <div class="kpis" id="kpis"></div>
+  </section>
+
+  <!-- ============================ QUEUE ============================ -->
+  <section>
+    <h2 data-help="queue">Background job queue
+      <span class="note">ZBACKGROUNDJOBWORKITEM — sampled every 10 s</span>
+      <span class="spacer"></span>
+    </h2>
+
+    <div class="grid g-2-1" style="margin-bottom:12px">
+      <div class="panel">
+        <h3 data-help="queue">Queue depth <span class="spacer"></span>
+          <span class="legend" id="legend-queue"></span>
+          <span class="windows" id="win-queue"></span>
+        </h3>
+        <div id="chart-queue"></div>
+      </div>
+      <div class="panel">
+        <h3>Queue facts</h3>
+        <div class="stats" id="queue-stats"></div>
+      </div>
+    </div>
+
+    <div class="grid g-2-1" style="margin-bottom:12px">
+      <div class="panel">
+        <h3 data-help="derived">Throughput <span class="spacer"></span>
+          <span class="legend" id="legend-throughput"></span>
+          <span class="windows" id="win-throughput"></span>
+        </h3>
+        <div id="chart-throughput"></div>
+        <div class="footnote">
+          The store keeps no record of finished jobs. <b>Completed</b> is derived from the
+          identity <code>pending_now = pending_prev + arrivals − departures</code>, taking
+          <code>arrivals</code> as the rows whose <code>ZTIMESTAMP</code> falls inside the
+          interval. It is an inference, not a counter Photos maintains.
+        </div>
+      </div>
+      <div class="panel">
+        <h3 data-help="attributable">Assets with the most work queued</h3>
+        <div class="scroll" id="queue-hot"></div>
+        <div class="footnote">
+          §19 records that this table has "no asset reference" — true of its columns, but
+          <code>ZIDENTIFIER</code> holds an asset UUID for most rows, so the queue is in
+          practice attributable. Rows whose identifier is a literal or a JSON blob are
+          marked <i>not an asset</i>.
+        </div>
+      </div>
+    </div>
+
+    <div class="grid g-2-1">
+      <div class="panel">
+        <h3 data-help="jobtype">Job mix <span class="sub">by ZJOBTYPE / ZJOBFLAGS</span>
+          <span class="spacer"></span>
+          <span class="legend" id="age-legend"></span>
+        </h3>
+        <div class="scroll" id="queue-mix"></div>
+        <div class="footnote">
+          <code>ZJOBFLAGS</code> is a bitmask — every observed value decomposes into powers
+          of two — so the bits are shown rather than named: the meaning of individual job
+          types and flags is not established, and guessing would be worse than saying so.
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Named jobs <span class="sub">non-UUID identifiers</span></h3>
+        <div class="scroll" id="queue-named"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================== ANALYSIS =========================== -->
+  <section>
+    <h2 data-help="coverage">Analysis progress
+      <span class="note">per-worker completion and the search index — sampled every 15 min / 60 s</span>
+    </h2>
+    <div class="grid g-1-2" style="margin-bottom:12px">
+      <div class="panel">
+        <h3 data-help="coverage">Work actually finished, per worker</h3>
+        <div id="coverage-bars"></div>
+        <div class="footnote">
+          <code>ZASSETANALYSISSTATE</code> is empty in every library measured, so it cannot
+          answer "how far has analysis got". <code>ZMEDIAANALYSISASSETATTRIBUTES</code> can:
+          one row per asset, one version column per worker, left at 0 until that worker has
+          run. A version &gt; 0 is direct evidence of completed work — the closest thing to
+          a finished-jobs record the store holds.
+        </div>
+      </div>
+      <div class="panel">
+        <h3 data-help="searchindex">Search index size <span class="spacer"></span>
+          <span class="legend" id="legend-index"></span>
+          <span class="windows" id="win-index"></span>
+        </h3>
+        <div id="chart-index"></div>
+      </div>
+    </div>
+
+    <div class="grid g-2-1" style="margin-bottom:12px">
+      <div class="panel">
+        <h3>Index coverage over time <span class="spacer"></span>
+          <span class="legend" id="legend-indexed"></span>
+          <span class="windows" id="win-indexed"></span>
+        </h3>
+        <div id="chart-indexed"></div>
+      </div>
+      <div class="panel">
+        <h3 data-help="searchindex">psi.sqlite</h3>
+        <div class="stats" id="index-stats"></div>
+        <div class="footnote" id="index-note"></div>
+      </div>
+    </div>
+
+    <div class="grid g3">
+      <div class="panel">
+        <h3 data-help="categories">Search term categories</h3>
+        <div class="scroll" id="index-categories"></div>
+      </div>
+      <div class="panel">
+        <h3 data-help="keywordsearch">Keyword searchability</h3>
+        <div id="index-missing"></div>
+        <div class="footnote">
+          Strings in <code>psi.sqlite</code> are NUL-terminated and occur in both Unicode
+          normalisation forms, so both are stripped and NFC-normalised before comparison —
+          without that this panel reports phantom missing keywords (§16, §19).
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Analysis side tables</h3>
+        <div class="stats" id="analysis-stats"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================== SCHEDULER ============================ -->
+  <section>
+    <h2 data-help="scheduler">Can anything run?
+      <span class="note">Duet scheduler verdicts and library holders — from the unified log, every 3 min</span>
+    </h2>
+    <div class="grid g-2-1" style="margin-bottom:12px">
+      <div class="panel">
+        <h3 data-help="scheduler">Scheduler verdicts <span class="spacer"></span>
+          <span class="legend" id="legend-scheduler"></span>
+          <span class="windows" id="win-scheduler"></span>
+        </h3>
+        <div id="chart-scheduler"></div>
+        <div class="footnote">
+          MNP = May Not Proceed, CP = Can Proceed, AMNP = Absolutely May Not Proceed. Whether
+          analysis is <i>allowed</i> to run is recorded nowhere on disk — only here. The heavy
+          policy is <i>Device Activity</i>, which refuses to run the work while somebody is at
+          the keyboard (§2.5).
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Log window</h3>
+        <div class="stats" id="sched-stats"></div>
+      </div>
+    </div>
+
+    <div class="grid g3">
+      <div class="panel">
+        <h3>Policies evaluated</h3>
+        <div class="scroll" id="sched-policies"></div>
+      </div>
+      <div class="panel">
+        <h3 data-help="holders">Processes holding the library</h3>
+        <div id="proc-table"></div>
+        <div class="footnote" id="proc-note"></div>
+        <div class="footnote">
+          Checking only <code>photolibraryd</code> misses the bulk of the work —
+          <code>photoanalysisd</code>, <code>mediaanalysisd</code> and
+          <code>managedcomputekitservice</code> do most of it (§2.5).
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Save-path and repair messages</h3>
+        <div class="scroll" id="log-lines"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================== WRITES ============================= -->
+  <section>
+    <h2 data-help="persistenthistory">Write activity
+      <span class="note">persistent history — every save Photos makes lands here</span>
+    </h2>
+    <div class="grid g-2-1" style="margin-bottom:12px">
+      <div class="panel">
+        <h3>Saves per minute <span class="spacer"></span>
+          <span class="legend" id="legend-writes"></span>
+          <span class="windows" id="win-writes"></span>
+        </h3>
+        <div id="chart-writes"></div>
+      </div>
+      <div class="panel">
+        <h3 data-help="persistenthistory">Persistent history</h3>
+        <div class="stats" id="write-stats"></div>
+      </div>
+    </div>
+    <div class="grid g2">
+      <div class="panel">
+        <h3 data-help="authors">Which subsystem is writing</h3>
+        <div class="scroll" id="write-authors"></div>
+        <div class="footnote">
+          From the <code>ATRANSACTIONSTRING</code> pool via <code>ZCONTEXTNAMETS</code>. These
+          names say more about what Photos is doing than any counter does.
+        </div>
+      </div>
+      <div class="panel">
+        <h3 data-help="zent">What changed, last hour</h3>
+        <div class="scroll" id="write-changes"></div>
+        <div class="footnote">
+          <code>ACHANGE.ZENTITY</code> holds a <code>Z_ENT</code>, which is not stable across a
+          repair (§2.2) — so it is mapped back to a name at read time, on the same connection.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================== CONTENT ============================ -->
+  <section>
+    <h2>Library content
+      <span class="note">census sampled every 15 min; these move over days, so the chart defaults to 30 d</span>
+    </h2>
+    <div class="panel" style="margin-bottom:12px">
+      <h3>Growth <span class="spacer"></span>
+        <span class="legend" id="legend-content"></span>
+        <span class="windows" id="win-content"></span>
+      </h3>
+      <div id="chart-content"></div>
+    </div>
+
+    <div class="grid g3" style="margin-bottom:12px">
+      <div class="panel">
+        <h3 data-help="assets">Assets</h3>
+        <div class="stats" id="asset-stats"></div>
+        <div class="footnote" id="asset-range"></div>
+        <div class="footnote">
+          Counted with <code>ZBUNDLESCOPE = 0 AND ZTRASHEDSTATE = 0</code>. "With GPS" excludes
+          the <code>-180.0</code> sentinel, which is what Photos stores for <i>no location</i>
+          instead of NULL (§8).
+        </div>
+      </div>
+      <div class="panel">
+        <h3 data-help="faces">People and faces</h3>
+        <div class="stats" id="people-stats"></div>
+        <div class="scroll" id="top-people" style="margin-top:10px;max-height:200px"></div>
+      </div>
+      <div class="panel">
+        <h3 data-help="albums">Albums and collections</h3>
+        <div class="stats" id="album-stats"></div>
+        <div class="footnote">
+          Album-like objects all share <code>ZGENERICALBUM</code> and are told apart by
+          <code>Z_ENT</code> + <code>ZKIND</code>, both resolved at runtime (§10).
+        </div>
+      </div>
+    </div>
+
+    <div class="grid g2">
+      <div class="panel">
+        <h3>Keywords</h3>
+        <div class="stats" id="keyword-stats"></div>
+        <div class="scroll" id="top-keywords" style="margin-top:10px;max-height:240px"></div>
+      </div>
+      <div class="panel">
+        <h3 data-help="resources">Resources <span class="sub">ZINTERNALRESOURCE — what backs each asset</span></h3>
+        <div class="stats" id="resource-stats"></div>
+        <div class="scroll" id="resource-types" style="margin-top:10px;max-height:200px"></div>
+        <div class="footnote">
+          <code>ZLOCALAVAILABILITY</code> 1 = the file is on this Mac, −1 = it is not. A populated
+          database with an empty-looking <code>originals/</code> is the "Optimise Mac Storage"
+          case, not a corrupt library (§12).
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================= DATABASE ============================ -->
+  <section>
+    <h2>Database
+      <span class="note">table census and the counter check that <code>integrity_check</code> cannot do</span>
+    </h2>
+    <div class="grid g-2-1">
+      <div class="panel">
+        <h3>Table census <span class="sub">largest 60 tables</span></h3>
+        <div class="scroll" id="census" style="max-height:420px"></div>
+      </div>
+      <div class="panel">
+        <h3 data-help="pkhealth">Primary-key counters</h3>
+        <div class="footnote" id="pk-summary"></div>
+        <div id="pk-faults"></div>
+        <div class="footnote">
+          Core Data allocates every primary key from <code>Z_PRIMARYKEY.Z_MAX + 1</code>. A table
+          whose highest row exceeds its counter means the next save collides, and <i>every</i>
+          edit in the library then fails silently — not just the rows that were written.
+          <code>PRAGMA integrity_check</code> returns <code>ok</code> in this state, so this is
+          the only check that catches it (§3.2, §20.2).
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================== STORAGE ============================ -->
+  <section>
+    <h2>Storage
+      <span class="note">bundle inventory walked every 6 h; database files sampled every 10 s</span>
+    </h2>
+    <div class="grid g-2-1" style="margin-bottom:12px">
+      <div class="panel">
+        <h3>Sizes over time <span class="spacer"></span>
+          <span class="legend" id="legend-storage"></span>
+          <span class="windows" id="win-storage"></span>
+        </h3>
+        <div id="chart-storage"></div>
+      </div>
+      <div class="panel">
+        <h3 data-help="wal">Database files</h3>
+        <div class="stats" id="db-files"></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Bundle inventory</h3>
+      <div class="stats" id="fs-stats"></div>
+      <div class="footnote">
+        Dot-directories are pruned from the walk: a third-party tagger pointed at
+        <code>originals/</code> creates <code>originals/.dtrash/</code> and moves deleted files
+        there rather than unlinking them, so they still occupy space inside the bundle and still
+        appear to a naive walk. It is counted separately when present (§1).
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================== HISTORY ============================ -->
+  <section>
+    <h2>Events <span class="note">state transitions worth knowing about</span></h2>
+    <div class="panel">
+      <div class="scroll events" id="events" style="max-height:320px"></div>
+    </div>
+  </section>
+
+  <!-- ========================= REFERENCE =========================== -->
+  <section>
+    <h2 data-help="workers">Reference
+      <span class="note">what the background workers do, and what the numbers mean</span>
+    </h2>
+    <div class="grid g2">
+      <div class="panel">
+        <h3>Background workers</h3>
+        <dl class="ref-grid" id="worker-ref"></dl>
+        <div class="footnote">
+          These names are read from the Objective-C class list of Apple's
+          <code>PhotoLibraryServices</code> framework, so they are real. Which worker a
+          given <code>ZJOBTYPE</code> number routes to is <b>not</b> established, so this
+          is a catalogue of the work Photos does — not a decoder for the numbers in the
+          job mix table.
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Codes seen in this library</h3>
+        <dl class="ref-grid">
+          <dt>ZJOBTYPE 11</dt>
+          <dd>Cascade donation. Every row of this type carries the literal identifier
+              <code>PLCascadeDonationRequired</code>, which names
+              <code>PLBackgroundJobCascadeDonationWorker</code> — donation is how Photos
+              hands content to Spotlight. The one job type whose meaning is settled by
+              direct evidence.</dd>
+          <dt>ZJOBTYPE 2</dt>
+          <dd>Mixed. Mostly per-asset, but some identifiers are JSON objects such as
+              <code>{"type":1700,"label":"Schueberfouer"}</code> naming a place, event or
+              category. Those inner numbers are not album kinds — only 2 of the 8 observed
+              exist in <code>ZGENERICALBUM.ZKIND</code>, and those albums have no title —
+              so they are a separate taxonomy of unknown meaning.</dd>
+          <dt>ZJOBFLAGS</dt>
+          <dd>A bitmask. Every observed value decomposes into powers of two
+              (3 = 1|2, 14 = 2|4|8, 1026 = 2|1024), so the individual bits are shown.
+              What each bit means is not established.</dd>
+          <dt>Scheduler verdicts</dt>
+          <dd><b>CP</b> Can Proceed · <b>MNP</b> May Not Proceed ·
+              <b>AMNP</b> Absolutely May Not Proceed. The policy that usually blocks work
+              is <i>Device Activity</i>, which refuses to run while the Mac is in use.</dd>
+          <dt>Search categories</dt>
+          <dd><b>1200</b> your keywords · <b>1500</b> / <b>1501</b> Apple's scene labels,
+              singular and plural. Other category numbers are not established.</dd>
+          <dt>ZLOCALAVAILABILITY</dt>
+          <dd><b>1</b> the file is on this Mac · <b>−1</b> it is not (iCloud only).</dd>
+          <dt>ZBUNDLESCOPE</dt>
+          <dd><b>0</b> your own library · <b>2</b> an iCloud Shared Album asset, which has
+              no file on disk.</dd>
+          <dt>Latitude −180.0</dt>
+          <dd>Not a real coordinate: it is the sentinel Photos stores for
+              <i>no location</i>, in place of NULL.</dd>
+        </dl>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Collector diagnostics</h2>
+    <div class="grid g3">
+      <div class="panel">
+        <h3 data-help="tiers">Sampling tiers</h3>
+        <div id="tiers"></div>
+        <div class="footnote">
+          Each tier's raw samples are compacted into coarser buckets as they age, keeping
+          min/max so a 30-day chart still shows spikes.
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Collector cost</h3>
+        <div class="scroll" id="collector-times" style="max-height:260px"></div>
+      </div>
+      <div class="panel">
+        <h3 data-help="history">History store</h3>
+        <div class="stats" id="hist-stats"></div>
+        <div id="sampler-errors" style="margin-top:8px"></div>
+      </div>
+    </div>
+    <div class="footnote" style="margin-top:12px">
+      Everything on this page is read-only: connections are opened <code>mode=ro</code>, nothing
+      writes to the library, and no lock is taken — safe to leave running while Photos is open.
+      Section references are to <code>APPLE-PHOTOS-LIBRARY-INTERNALS.md</code>.
+    </div>
+  </section>
+</main>
+
+<script src="/static/glossary.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

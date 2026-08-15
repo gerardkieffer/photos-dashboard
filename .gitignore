@@ -1,0 +1,29 @@
+# Sampled history and snapshot stores.
+#
+# Excluded for privacy as much as for size: these SQLite files hold data derived
+# from a real photo library — keyword titles, people's names, original filenames,
+# album names and library paths. They are per-machine state and must never be
+# published.
+snapshots/
+
+# Scratch copies made by --snapshot-mode live in the system temp directory, but
+# catch any that are redirected here.
+*.photoslibrary/
+photodash-snap-*/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Editors
+.idea/
+*.swp
