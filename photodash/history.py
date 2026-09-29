@@ -20,10 +20,13 @@ resolution gives a sensible number of points for the requested window.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
 from pathlib import Path
+
+from .safety import outside_library
 
 HOUR = 3600
 DAY = 86400
@@ -47,6 +50,7 @@ TIERS: dict[str, dict] = {
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
+BEGIN IMMEDIATE;
 
 CREATE TABLE IF NOT EXISTS sample (
     metric TEXT    NOT NULL,
@@ -78,6 +82,7 @@ CREATE TABLE IF NOT EXISTS event (
     message  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_event_ts ON event(ts DESC);
+COMMIT;
 """
 
 SNAPSHOT_KEEP = {
@@ -92,14 +97,47 @@ SNAPSHOT_KEEP = {
 class History:
     """Thread-safe wrapper around the time-series SQLite file."""
 
-    def __init__(self, path: Path):
-        self.path = Path(path)
+    def __init__(self, path: Path, library: Path | None = None):
+        self.path = outside_library(path, library)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Never initialize an existing arbitrary database, even if it was
+        # selected accidentally or is a hard link to a library database.
+        if self.path.exists():
+            if not self.path.is_file() or self.path.stat().st_nlink != 1:
+                raise ValueError('History must be a regular file with no hard links')
+            probe = sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True)
+            try:
+                expected = {
+                    'sample': ['metric', 'res', 'ts', 'value', 'vmin', 'vmax', 'n', 'tier'],
+                    'snapshot': ['name', 'ts', 'payload'],
+                    'event': ['ts', 'kind', 'severity', 'message'],
+                }
+                tables = {r[0] for r in probe.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                empty = not probe.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+                if not empty and (tables != set(expected) or probe.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type IN ('trigger','view')").fetchone()):
+                    # An empty file/store can be left by interrupted first-run
+                    # initialization. Never accept a partly unrelated schema.
+                    raise ValueError('Existing file is not a dashboard history database')
+                for table, columns in (expected.items() if not empty else []):
+                    if [r[1] for r in probe.execute(f'PRAGMA table_info({table})')] != columns:
+                        raise ValueError('Unrecognized dashboard history schema')
+            finally:
+                probe.close()
+        else:
+            # Exclusive creation avoids following a file installed between
+            # validation and creation; private permissions protect metadata.
+            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
         self._lock = threading.Lock()
         self._con = sqlite3.connect(self.path, check_same_thread=False)
         self._con.row_factory = sqlite3.Row
-        self._con.executescript(SCHEMA)
-        self._con.commit()
+        try:
+            self._con.executescript(SCHEMA)
+        except BaseException:
+            self._con.close()
+            raise
 
     # ---- writing ---------------------------------------------------------
     def record(self, tier: str, values: dict[str, float], ts: float | None = None) -> None:

@@ -5,6 +5,14 @@
  * as a few hundred points with min/max bands preserved.
  */
 
+const apiFetch = (url, options = {}) => fetch(url, {
+  ...options,
+  headers: { ...options.headers,
+    'X-PhotosDashboard-Token': document.querySelector('meta[name="dashboard-token"]').content },
+});
+const escapeHtml = value => String(value).replace(/[&<>"']/g,
+  c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
+
 const $ = (sel, root = document) => root.querySelector(sel);
 const el = (tag, cls, txt) => {
   const n = document.createElement(tag);
@@ -242,7 +250,7 @@ async function refreshChart(name) {
   const keys = cfg.series.map(s => s.key).join(',');
   let data;
   try {
-    const r = await fetch(`/api/series?metrics=${encodeURIComponent(keys)}&window=${cfg.window}`);
+    const r = await apiFetch(`/api/series?metrics=${encodeURIComponent(keys)}&window=${cfg.window}`);
     data = await r.json();
   } catch {
     return;                    // server restarting; tick() reports the outage
@@ -334,6 +342,8 @@ function bars(host, rows) {
     const row = el('div', 'bar-row');
     row.appendChild(el('div', 'bl', r.label));
     const track = el('div', 'bar-track');
+    // Preserve the row layout without implying progress for unknown coverage.
+    track.style.visibility = Number.isFinite(r.pct) ? 'visible' : 'hidden';
     const fill = el('div', 'bar-fill');
     fill.style.width = Math.max(0, Math.min(100, r.pct)) + '%';
     fill.style.background = r.color || (r.pct >= 99.5 ? 'var(--ok)'
@@ -384,8 +394,7 @@ function render(s) {
   const badge = $('#access-mode');
   // textContent wipes the injected hint button, so re-attach it afterwards.
   badge.textContent = acc.mode === 'snapshot'
-    ? (acc.apfs_clone ? 'snapshot (clone) · library never opened'
-                      : 'snapshot · library never opened')
+    ? 'snapshot · consistent backup'
     : 'read-only';
   badge.className = 'pill ' + (acc.mode === 'snapshot' ? 'ok' : 'dim');
   attachHelp(badge.parentElement);
@@ -412,7 +421,7 @@ function render(s) {
  * (photodash/docs.py) and cannot drift between the terminal and the browser. */
 let DOCS = {};
 async function loadDocs() {
-  try { DOCS = (await (await fetch('/api/docs')).json()).topics || {}; } catch {}
+  try { DOCS = (await (await apiFetch('/api/docs')).json()).topics || {}; } catch {}
 }
 
 function docLink(key) {
@@ -442,9 +451,15 @@ function renderBanners(s) {
   const host = $('#banners');
   host.innerHTML = '';
 
+  if (s.switch_error) {
+    banner(host, 'warn',
+      `<b>Library switch failed.</b> ${escapeHtml(s.switch_error)}. ` +
+      `The previous library remains selected.`, 'unavailable');
+  }
+
   if (s.status && s.status !== 'ok') {
     banner(host, 'err',
-      `<b>${s.status}.</b> ${s.status_detail ? `<code>${s.status_detail}</code>` : ''} ` +
+      `<b>${escapeHtml(s.status)}.</b> ${s.status_detail ? `<code>${escapeHtml(s.status_detail)}</code>` : ''} ` +
       `The dashboard keeps showing the last successful sample until it can read again.`,
       'unavailable');
   }
@@ -453,7 +468,7 @@ function renderBanners(s) {
     const names = pk.faults.map(f => `${f.table} (MAX(Z_PK)=${f.max_pk} > Z_MAX=${f.z_max})`).join(', ');
     banner(host, 'err',
       `<b>Primary-key counter behind.</b> Photos cannot save, and background analysis writes ` +
-      `will fail silently: ${names}. <code>PRAGMA integrity_check</code> returns <code>ok</code> ` +
+      `will fail silently: ${escapeHtml(names)}. <code>PRAGMA integrity_check</code> returns <code>ok</code> ` +
       `in this state, so it cannot rule the problem out.`, 'pk-fault');
   }
   if (s.log && s.log.constraint_violations > 0) {
@@ -477,13 +492,13 @@ function renderBanners(s) {
   }
   if (s.access && s.access.error) {
     banner(host, 'err',
-      `<b>Snapshot copy failed.</b> <code>${s.access.error}</code>`, 'snapshot');
+      `<b>Snapshot copy failed.</b> <code>${escapeHtml(s.access.error)}</code>`, 'snapshot');
   }
   const errs = s.sampler && s.sampler.errors;
   if (errs && errs.length) {
     banner(host, 'warn',
       `<b>${errs.length} collector error${errs.length > 1 ? 's' : ''}.</b> ` +
-      `Some panels may be stale — the most recent is <code>${errs[errs.length - 1]}</code>.`,
+      `Some panels may be stale — the most recent is <code>${escapeHtml(errs[errs.length - 1])}</code>.`,
       'diagnostics');
   }
 }
@@ -630,7 +645,9 @@ function renderAnalysis(s) {
   bars($('#coverage-bars'), (cov.workers || []).map(w => ({
     label: w.label,
     pct: w.pct,
-    value: `${fmt.int(w.done)} / ${fmt.int(w.total)}`,
+    value: !w.done ? 'no recorded analysis'
+      : w.total == null ? `${fmt.int(w.done)} recorded`
+      : `${fmt.int(w.done)} / ${fmt.int(w.total)}`,
   })));
 
   const side = s.side_tables || {}, srch = s.search || {};
@@ -952,7 +969,7 @@ function renderDiag(s) {
 async function refreshEvents() {
   let events;
   try {
-    const r = await fetch('/api/events?limit=120');
+    const r = await apiFetch('/api/events?limit=120');
     ({ events } = await r.json());
   } catch {
     return;
@@ -979,7 +996,7 @@ async function refreshEvents() {
 async function refreshLibraries() {
   let data;
   try {
-    data = await (await fetch('/api/libraries')).json();
+    data = await (await apiFetch('/api/libraries')).json();
   } catch { return; }
   const menu = $('#libpick-menu');
   menu.innerHTML = '';
@@ -999,7 +1016,7 @@ async function refreshLibraries() {
       $('#libpick').classList.remove('open');
       $('#status-text').textContent = 'switching library…';
       try {
-        const r = await fetch('/api/select-library', {
+        const r = await apiFetch('/api/select-library', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: l.path }),
@@ -1053,7 +1070,7 @@ function renderWorkerReference() {
 /* ------------------------------------------------------------------ loop */
 async function tick() {
   try {
-    const r = await fetch('/api/snapshot');
+    const r = await apiFetch('/api/snapshot');
     render(await r.json());
   } catch (err) {
     $('#status-dot').className = 'dot err';

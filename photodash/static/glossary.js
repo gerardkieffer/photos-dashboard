@@ -151,8 +151,9 @@ const GLOSSARY = {
       <code>ZMEDIAANALYSISASSETATTRIBUTES</code> has one row per asset and one version
       column per analysis worker, left at zero until that worker has processed the asset.
       A version greater than zero is direct evidence of completed work.</p>
-      <p>A worker sitting at 0% is not necessarily broken — some only apply to videos, and
-      some features are hardware- or region-dependent.</p>`,
+      <p>Video workers show counts without percentages because their eligible asset
+      population is not established. "No recorded analysis" means no positive versions
+      were found; it does not establish whether the worker is applicable or stalled.</p>`,
   },
   pkhealth: {
     title: 'Save integrity — the check integrity_check cannot do',
@@ -247,13 +248,15 @@ const GLOSSARY = {
       <code>mode=ro</code>, the connection runs under <code>PRAGMA query_only</code>, and a
       SQLite authorizer rejects every non-read operation before a statement is even
       compiled.</p>
-      <p><b>Direct mode</b> never writes the database or its WAL — that is verified
-      byte-for-byte by <code>test_readonly.py</code>. SQLite may still update the
+      <p><b>Direct mode</b> opens the database and its WAL read-only.
+      <code>test_readonly.py</code> checks database/WAL contents byte-for-byte on
+      disposable WAL-mode copies. SQLite may still update the
       <code>-shm</code> WAL index, which every reader of a WAL database does, Photos
       included.</p>
-      <p><b>Snapshot mode</b> (<code>--snapshot-mode</code>) copies the database files
-      aside and reads the copy, so not one byte inside the library bundle is written. On
-      the same APFS volume the copy is a clone and costs almost nothing.</p>`,
+      <p><b>Snapshot mode</b> (<code>--snapshot-mode</code>) uses SQLite to create consistent database backups, then queries those copies.
+      Backup readers can also update source shared-memory files. Full copies require
+      disk space; they are not APFS clones. The read transaction can grow the source
+      WAL while writers continue. Use an offline library copy for isolation.</p>`,
   },
   tiers: {
     title: 'Why different data is sampled at different rates',

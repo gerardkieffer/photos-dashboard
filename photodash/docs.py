@@ -65,7 +65,7 @@ TOPICS: dict[str, tuple[str, str | None, str]] = {
     ),
     "snapshot": (
         "Snapshot mode", None,
-        "Read a copy so that nothing inside the library bundle is written.",
+        "Query consistent database backups; source shared-memory files may still change.",
     ),
     "history": (
         "Stored history", None,

@@ -34,7 +34,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -42,12 +44,14 @@ from photodash import collectors as C
 from photodash import coredata as ph
 from photodash import docs
 from photodash.server import serve
+from photodash.safety import outside_library
 
 
-def pick_library(explicit: Path | None) -> Path:
+def pick_library(explicit: Path | None, snapshot_mode: bool = False) -> Path:
     if explicit:
         lib = Path(explicit)
-        if not C.readable(lib):
+        if not ((lib / "database" / "Photos.sqlite").is_file()
+                if snapshot_mode else C.readable(lib)):
             ph.eprint(f"ERROR: cannot read {lib}")
             ph.eprint("  Either there is no library there, or macOS is blocking it.")
             ph.eprint("  A library under your home directory needs Full Disk Access;")
@@ -55,7 +59,7 @@ def pick_library(explicit: Path | None) -> Path:
             ph.eprint(docs.cli("blocked"))
             raise SystemExit(2)
         return lib
-    readable = [e for e in C.discover_libraries() if e["readable"]]
+    readable = [e for e in C.discover_libraries(deep=not snapshot_mode) if e["readable"]]
     if not readable:
         ph.eprint("ERROR: no readable Photos library found.")
         ph.eprint("  Run with --list to see what was found and what macOS is blocking.")
@@ -88,15 +92,15 @@ def history_path_for(lib: Path, explicit: Path | None) -> Path:
     return ph.PROJECT_DIR / "snapshots" / "dashboard" / f"{safe}-{inode}.db"
 
 
-def cmd_list() -> int:
-    libs = C.discover_libraries()
+def cmd_list(snapshot_mode: bool = False) -> int:
+    libs = C.discover_libraries(deep=not snapshot_mode)
     if not libs:
         print("no *.photoslibrary bundles found")
         print(docs.cli("no-library"))
         return 1
     width = max(len(l["name"]) for l in libs)
     for l in libs:
-        mark = "readable" if l["readable"] else "BLOCKED (needs Full Disk Access)"
+        mark = ("candidate (not opened)" if snapshot_mode else "readable") if l["readable"] else "BLOCKED (needs Full Disk Access)"
         size = f'  {C.human(l["db_bytes"])}' if l.get("db_bytes") else ""
         print(f'  {l["name"]:<{width}}  {mark}{size}')
         print(f'  {"":<{width}}  {l["path"]}')
@@ -106,10 +110,22 @@ def cmd_list() -> int:
     return 0
 
 
-def cmd_once(lib: Path) -> int:
+def cmd_once(lib: Path, snapshot_mode: bool = False,
+             snapshot_dir: Path | None = None) -> int:
+    if not snapshot_mode:
+        return _cmd_once(lib)
+    parent = outside_library(snapshot_dir, lib) if snapshot_dir else None
+    with tempfile.TemporaryDirectory(prefix="photodash-snap-", dir=parent) as scratch:
+        snap = C.Snapshotter(lib, Path(scratch))
+        if not snap.refresh(force=True):
+            raise RuntimeError(snap.error)
+        return _cmd_once(lib, snap.dir)
+
+
+def _cmd_once(lib: Path, dbdir: Path | None = None) -> int:
     """One pass of every collector, as JSON. Useful for scripting and for
     checking what the dashboard would show without starting a server."""
-    con = C.open_db(lib)
+    con = C.open_db(lib, dbdir)
     try:
         out = {
             "identity": C.collect_identity(lib),
@@ -128,7 +144,7 @@ def cmd_once(lib: Path) -> int:
             "side_tables": C.collect_analysis_side_tables(con),
             "pk_health": C.collect_pk_health(con),
             "census": C.collect_table_census(con),
-            "search": C.collect_search_index(lib, con),
+            "search": C.collect_search_index(lib, con, dbdir),
             "processes": C.collect_processes(lib),
         }
     finally:
@@ -145,7 +161,7 @@ def main() -> int:
                     help="path to the .photoslibrary bundle (default: first readable)")
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--host", default="127.0.0.1",
-                    help="bind address (default: localhost only)")
+                    help="loopback bind address: 127.0.0.1 or localhost")
     ap.add_argument("--history", type=Path,
                     help="time-series store (default: snapshots/dashboard/<library>-<inode>.db, "
                          "one file per library so their series never interleave)")
@@ -157,35 +173,54 @@ def main() -> int:
     ap.add_argument("--no-fs-walk", action="store_true",
                     help="skip the filesystem inventory (tens of thousands of stat calls)")
     ap.add_argument("--snapshot-mode", action="store_true",
-                    help="never open the library at all: copy Photos.sqlite + -wal + -shm "
-                         "aside and read the copy. Direct mode already never writes the "
-                         "database or its WAL, but SQLite does update the -shm WAL-index; "
-                         "this avoids even that, at the cost of freshness. On the same APFS "
-                         "volume the copy is a clone and is effectively free.")
-    ap.add_argument("--snapshot-interval", type=float, default=60.0,
-                    help="seconds between snapshot refreshes (default: 60). Live metrics "
-                         "are only as fresh as this.")
+                    help="query consistent SQLite backups; source database and WAL stay "
+                         "read-only, but SQLite may update source shared-memory files")
+    ap.add_argument("--snapshot-interval", type=float, default=300.0,
+                    help="seconds between snapshot attempts (default: 300)")
+    ap.add_argument("--snapshot-dir", type=Path,
+                    help="existing scratch parent outside any library; allow space for "
+                         "two copies of the databases (default: system temp directory)")
     ap.add_argument("--list", action="store_true",
                     help="list every library found, and whether it can be read")
     ap.add_argument("--once", action="store_true",
                     help="run every collector once, print JSON, exit")
     args = ap.parse_args()
 
-    if args.list:
-        return cmd_list()
-    lib = pick_library(args.library)
-    if args.once:
-        return cmd_once(lib)
+    if args.host not in ("127.0.0.1", "localhost"):
+        ap.error("--host must be 127.0.0.1 or localhost; remote access is not supported")
+    if not 1 <= args.port <= 65535:
+        ap.error("--port must be between 1 and 65535")
+    if not 1 <= args.snapshot_interval <= 86400:
+        ap.error("--snapshot-interval must be between 1 and 86400 seconds")
+    if args.log_minutes < 1 or args.log_interval < 1:
+        ap.error("log intervals must be positive")
+    try:
+        if args.snapshot_dir:
+            args.snapshot_dir = outside_library(args.snapshot_dir, args.library)
+            if not args.snapshot_dir.is_dir():
+                ap.error("--snapshot-dir must be an existing directory")
+        if args.list:
+            return cmd_list(args.snapshot_mode)
+        lib = pick_library(args.library, args.snapshot_mode)
+        if args.once:
+            return cmd_once(lib, args.snapshot_mode, args.snapshot_dir)
 
-    print("Apple Photos library dashboard")
-    # A factory, not a path: the library can be switched from the UI, and each
-    # library must keep its own history file. An explicit --history applies only
-    # to the library it was given for; switching away still derives a fresh one
-    # rather than interleaving two libraries' series in one file.
-    return serve(lib, lambda l: history_path_for(l, args.history if l == lib else None),
-                 args.host, args.port, args.log_minutes, args.log_interval,
-                 not args.no_fs_walk, args.snapshot_mode,
-                 args.snapshot_interval) or 0
+        print("Apple Photos library dashboard")
+        # A factory, not a path: the library can be switched from the UI, and each
+        # library must keep its own history file. An explicit --history applies only
+        # to the library it was given for; switching away still derives a fresh one
+        # rather than interleaving two libraries' series in one file.
+        return serve(lib, lambda l: history_path_for(l, args.history if l == lib else None),
+                     args.host, args.port, args.log_minutes, args.log_interval,
+                     not args.no_fs_walk, args.snapshot_mode,
+                     args.snapshot_interval, args.snapshot_dir) or 0
+
+    except (ValueError, OSError, sqlite3.Error, RuntimeError) as exc:
+        ph.eprint(f"ERROR: {exc}")
+        return 2
+    except KeyboardInterrupt:
+        ph.eprint("Cancelled.")
+        return 130
 
 
 if __name__ == "__main__":

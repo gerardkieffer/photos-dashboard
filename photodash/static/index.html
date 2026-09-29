@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head>
+<meta name="dashboard-token" content="__DASHBOARD_TOKEN__">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Photos library dashboard</title>
@@ -452,8 +453,7 @@
       </div>
     </div>
     <div class="footnote" style="margin-top:12px">
-      Everything on this page is read-only: connections are opened <code>mode=ro</code>, nothing
-      writes to the library, and no lock is taken — safe to leave running while Photos is open.
+      Everything on this page is read-only: connections are opened <code>mode=ro</code>, the database and WAL remain read-only. SQLite uses reader locks and may update shared-memory files.
       Section references are to <code>APPLE-PHOTOS-LIBRARY-INTERNALS.md</code>.
     </div>
   </section>
