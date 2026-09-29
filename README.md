@@ -62,33 +62,43 @@ If `--list` shows your library as `BLOCKED`, that is macOS TCC, not a bug — se
 [DOCUMENTATION.md](DOCUMENTATION.md#a-library-is-listed-as-blocked). A library on an
 external volume needs no permission at all.
 
-## Your library is never modified
+## Library safety
 
-This reads a database that is difficult to replace and impossible to un-corrupt, so
-read-only is **enforced three independent ways**, not promised once:
+The library database and its transaction log are opened read-only. Connections use
+`mode=ro`, `PRAGMA query_only`, and a SQLite authorizer that rejects writes.
+**SQLite may create or update shared-memory (`-shm`) files in either access mode.**
+The dashboard does not edit or delete original photos. History destinations inside
+Photos libraries, hard-linked files, and unrelated existing databases are rejected.
 
-1. `mode=ro` on the connection URI — the OS file handle is read-only
-2. `PRAGMA query_only` on the connection
-3. a **SQLite authorizer** that rejects every non-read action inside SQLite, before a
-   statement is even compiled
+`--snapshot-mode` runs collectors against consistent SQLite backups. Backups coordinate
+with live writers using SQLite's backup API; separate file copies cannot safely capture
+a changing database. A pinned read transaction prevents concurrent commits from
+restarting the chunked backup. WAL writers can continue, but the source WAL may grow
+until the backup finishes or is cancelled. A failed refresh retains the last complete copy. This
+mode is **not** a guarantee of zero changes inside the source bundle: backup readers
+can also update its shared memory. For complete isolation, point the dashboard at an
+independent, offline library copy instead of the original.
 
-And it ships with an executable test:
+The server accepts loopback connections only, checks Host/Origin, and requires a
+per-run token on API requests. The browser supplies it automatically. Metadata shown
+by the dashboard is private; do not expose it through a proxy or tunnel.
+
+For a large library, start with `--no-fs-walk` to skip its file inventory. Snapshot
+backups copy databases, not the photo originals, but need space for two generations.
+Each refresh rewrites the databases; the next attempt waits five minutes by default. `--snapshot-dir` selects an existing
+scratch parent outside the library. These are real copies, not APFS clones.
+
+Run synthetic safety regressions without accessing a Photos library:
 
 ```bash
-python3 test_readonly.py
+python3 -m unittest -v test_safety test_review_regressions
+python3 test_docs.py
 ```
 
-which issues real writes and checks each is refused, then clones a library, SHA-256s
-every file, runs every collector, and re-hashes — comparing content, size, mtime **and
-inode**.
-
-**Direct mode leaves `Photos.sqlite` and its WAL byte-identical.** One honest caveat:
-SQLite does update the `-shm` file, the WAL index — a derived scratch file holding no
-library data that *every* reader of a WAL database touches.
-
-**`--snapshot-mode` avoids even that**, reading a copy so nothing inside the bundle is
-written. On the same APFS volume the copy is a clone: a 1 GB library "copies" in
-less than a second using nearly no extra space.
+The optional `python3 test_readonly.py --library PATH` first backs up the selected
+library read-only, then attempts writes and checks collectors only against disposable
+copies with committed WAL data present. It cannot prove all future behavior or performance on a particular library.
+Keep an independent backup of irreplaceable photos.
 
 ## Screenshot
 Display [full size screenshot of dashboard](screenshot-full-height.png)
@@ -162,7 +172,8 @@ Issues and pull requests welcome. Two things to keep in mind:
 Run before submitting:
 
 ```bash
-python3 test_readonly.py
+python3 -m unittest -v test_safety test_review_regressions
+python3 test_docs.py
 python3 -m py_compile photo_dashboard.py photodash/*.py test_readonly.py
 ```
 

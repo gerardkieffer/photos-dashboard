@@ -1,8 +1,8 @@
 """Sampler thread + HTTP API for the Photos library dashboard.
 
-The sampler owns all the reading. HTTP handlers never touch the library: they
-serve the last completed sample out of memory and the history out of SQLite, so
-a slow `log show` or a spun-down external disk can never make the page hang.
+The sampler owns metric collection. Snapshot/chart requests serve completed
+samples and history. Discovery and selection may inspect library paths, but
+replacement preparation and backup copying do not hold the API state lock.
 
 Collection is tiered (see history.TIERS) because the underlying facts move at
 different speeds — queue depth every few seconds, the asset census every few
@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import secrets
 import shutil
 import tempfile
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -27,6 +29,7 @@ from urllib.parse import parse_qs, urlparse
 from . import collectors as C
 from . import docs
 from .history import TIERS, History
+from .safety import outside_library
 
 STATIC = Path(__file__).resolve().parent / "static"
 
@@ -57,14 +60,16 @@ class Sampler(threading.Thread):
         # Previous readings, for the derived throughput maths.
         self._prev_queue: tuple[float, int, int] | None = None   # ts, pending, arrivals_total
         self._prev_flags: dict = {}
+        self.workers: list[threading.Thread] = []
 
     # ---- helpers ---------------------------------------------------------
     def _publish(self, key: str, value) -> None:
         with self.lock:
             self.state[key] = value
-            self.state["status"] = "ok"
-            self.state.pop("status_detail", None)
-            self.state.pop("status_help", None)
+            if key not in ("log", "filesystem"):
+                self.state["status"] = "ok"
+                self.state.pop("status_detail", None)
+                self.state.pop("status_help", None)
             self.state["updated_at"] = time.time()
 
     def _note(self, msg: str) -> None:
@@ -77,7 +82,8 @@ class Sampler(threading.Thread):
         try:
             return fn(*a, **kw)
         finally:
-            self.durations[name] = time.time() - t0
+            with self.lock:
+                self.durations[name] = time.time() - t0
 
     @property
     def dbdir(self) -> Path | None:
@@ -178,17 +184,19 @@ class Sampler(threading.Thread):
         self.history.record_snapshot("authors", authors)
 
         metrics = {
-            "search.bytes": search.get("bytes", 0),
-            "search.assets_indexed": search.get("assets_indexed", 0),
-            "search.groups_total": search.get("groups_total", 0),
-            "search.keywords_indexed": search.get("keywords_indexed", 0),
-            "search.keywords_missing": search.get("keywords_missing_count", 0),
             "proc.holders": procs["holder_count"],
             "proc.photos_running": 1 if procs["photos_running"] else 0,
         }
-        if search.get("assets_total"):
-            metrics["search.coverage_pct"] = (
-                100.0 * search.get("assets_indexed", 0) / search["assets_total"])
+        if not search.get("error"):
+            for metric, key in (("bytes", "bytes"), ("assets_indexed", "assets_indexed"),
+                                ("groups_total", "groups_total"),
+                                ("keywords_indexed", "keywords_indexed"),
+                                ("keywords_missing", "keywords_missing_count")):
+                if key in search:
+                    metrics[f"search.{metric}"] = search[key]
+            if search.get("assets_total"):
+                metrics["search.coverage_pct"] = (
+                    100.0 * search.get("assets_indexed", 0) / search["assets_total"])
         self.history.record("medium", {k: v for k, v in metrics.items() if v is not None})
 
         self._detect_events(procs, search)
@@ -245,7 +253,7 @@ class Sampler(threading.Thread):
     def tier_rare(self, con) -> None:
         if not self.walk_fs:
             return
-        fs = self._timed("filesystem", C.collect_filesystem, self.library)
+        fs = self._timed("filesystem", C.collect_filesystem, self.library, self.stop_event)
         self._publish("filesystem", fs)
         self.history.record_snapshot("filesystem", fs)
         metrics = {"fs.volume_free_bytes": fs.get("volume_free_bytes", 0),
@@ -291,7 +299,9 @@ class Sampler(threading.Thread):
     def _log_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                data = self._timed("log", C.collect_log, self.log_minutes)
+                data = self._timed("log", C.collect_log, self.log_minutes, self.stop_event)
+                if self.stop_event.is_set():
+                    break
                 self._publish("log", data)
                 m = {f"log.decision_{k}": v for k, v in data["decisions"].items()}
                 m["log.constraint_violations"] = data["constraint_violations"]
@@ -320,14 +330,39 @@ class Sampler(threading.Thread):
             self.stop_event.wait(self.log_interval)
 
     # ---- main loop -------------------------------------------------------
+    def _filesystem_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                self.tier_rare(None)
+                self.pass_counts["rare"] += 1
+                self.last_pass["rare"] = time.time()
+            except Exception as exc:
+                self._note(f"filesystem: {exc}")
+            self.stop_event.wait(TIERS["rare"]["interval"])
+
     def run(self) -> None:
-        threading.Thread(target=self._log_loop, daemon=True, name="log").start()
+        self.workers = [threading.Thread(target=self._log_loop, daemon=True, name="log")]
+        if self.walk_fs:
+            self.workers.append(threading.Thread(target=self._filesystem_loop,
+                                                 daemon=True, name="filesystem"))
+        for worker in self.workers:
+            worker.start()
+        try:
+            self._sample_loop()
+        finally:
+            self.stop_event.set()
+            if self.snapshotter:
+                self.snapshotter.stop_event.set()
+            for worker in self.workers:
+                worker.join()
+
+    def _sample_loop(self) -> None:
         handlers = {"live": self.tier_live, "medium": self.tier_medium,
-                    "slow": self.tier_slow, "rare": self.tier_rare}
+                    "slow": self.tier_slow}
         while not self.stop_event.is_set():
             now = time.time()
             due = [t for t, cfg in TIERS.items()
-                   if now - self.last_pass[t] >= cfg["interval"]]
+                   if t != "rare" and now - self.last_pass[t] >= cfg["interval"]]
             if due:
                 con = None
                 try:
@@ -335,10 +370,14 @@ class Sampler(threading.Thread):
                         # Refresh before reading, so every tier in this pass
                         # sees one consistent copy rather than a moving target.
                         self._timed("snapshot", self.snapshotter.refresh)
-                    con = C.open_db(self.library, self.dbdir)
-                    for tier in ("live", "medium", "slow", "rare"):
+                        if not self.snapshotter.last_copy:
+                            raise RuntimeError(self.snapshotter.error or "No complete snapshot")
+                    con = C.open_db(self.library, self.dbdir, stop_event=self.stop_event)
+                    for tier in ("live", "medium", "slow"):
                         if tier not in due:
                             continue
+                        if self.stop_event.is_set():
+                            break
                         try:
                             handlers[tier](con)
                             self.pass_counts[tier] += 1
@@ -369,21 +408,21 @@ class Sampler(threading.Thread):
         with self.lock:
             state = dict(self.state)
             errors = list(self.errors)
+            durations = dict(self.durations)
         state["sampler"] = {
             "uptime_s": time.time() - self.started_at,
             "passes": dict(self.pass_counts),
             "last_pass": dict(self.last_pass),
             "intervals": {t: c["interval"] for t, c in TIERS.items()},
-            "durations": {k: round(v, 3) for k, v in self.durations.items()},
+            "durations": {k: round(v, 3) for k, v in durations.items()},
             "errors": errors,
         }
         state["access"] = self.snapshotter.status() if self.snapshotter else {
             "mode": "direct",
             # Precise rather than reassuring: what is and is not guaranteed.
-            "note": "Photos.sqlite and its WAL are never written (proved "
-                    "byte-for-byte by test_readonly.py). SQLite may update the "
+            "note": "Photos.sqlite and its WAL are opened read-only. SQLite may update the "
                     "-shm WAL-index, a derived scratch file every WAL reader "
-                    "touches. Use --snapshot-mode to avoid even that.",
+                    "touches. Snapshot backups can also update source shared memory.",
         }
         state["history"] = self.history.stats()
         return state
@@ -392,112 +431,176 @@ class Sampler(threading.Thread):
 # --------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------
-class Supervisor:
-    """Owns the current sampler, so the library can be switched while running.
+@dataclass
+class LibrarySession:
+    sampler: Sampler
+    history: History
+    snapshotter: C.Snapshotter | None
 
-    Switching means three things move together: the sampler, the history file
-    (one per library — mixing them would draw a cliff from one library's asset
-    count to another's), and the snapshot directory. Doing it here keeps that
-    invariant in one place, and holding the lock across the swap means an HTTP
-    request can never observe a half-switched state.
+    def request_stop(self) -> None:
+        self.sampler.stop_event.set()
+        if self.snapshotter:
+            self.snapshotter.stop_event.set()
+
+    def close(self) -> None:
+        """Only release resources after all readers/workers have stopped."""
+        self.request_stop()
+        if self.sampler.ident is not None:
+            self.sampler.join()
+        try:
+            self.history.close()
+        finally:
+            if self.snapshotter:
+                self.snapshotter.cleanup()
+
+
+class Supervisor:
+    """Prepare replacements outside the API lock; publish complete sessions.
+
+    Control operations are serialized separately from reads. Retired sessions
+    stop in the background, retaining their resources until their workers exit.
+    Normal shutdown waits for those cleanups, including slow filesystem calls.
     """
 
     def __init__(self, opts: dict):
         self.opts = opts
         self.lock = threading.Lock()
-        self.sampler: Sampler | None = None
-        self.history: History | None = None
-        self.snapshotter: C.Snapshotter | None = None
+        self.control_lock = threading.Lock()
+        self.session: LibrarySession | None = None
+        self.retired: list[threading.Thread] = []
+        self.switch_error: str | None = None
+        self.stopping = False
+
+    def _prepare(self, library: Path) -> LibrarySession:
+        o = self.opts
+        history = None
+        scratch = None
+        try:
+            history = History(o["history_for"](library), library)
+            snapshotter = None
+            if o["snapshot_mode"]:
+                parent = o.get("snapshot_dir")
+                if parent is not None:
+                    parent = outside_library(parent, library)
+                scratch = Path(tempfile.mkdtemp(prefix="photodash-snap-", dir=parent))
+                snapshotter = C.Snapshotter(library, scratch, o["snapshot_interval"])
+            sampler = Sampler(library, history, o["log_minutes"],
+                              o["log_interval"], o["walk_fs"], snapshotter)
+            # The sampler performs the first backup asynchronously. No source
+            # backup, thread join, or history setup runs under the API lock.
+            return LibrarySession(sampler, history, snapshotter)
+        except BaseException:
+            try:
+                if history:
+                    history.close()
+            finally:
+                if scratch:
+                    shutil.rmtree(scratch, ignore_errors=True)
+            raise
+
+    def _retire(self, session: LibrarySession) -> None:
+        session.request_stop()
+        # Non-daemon cleanup also protects normal interpreter exit. It must
+        # not unlink scratch databases while a reader is still using them.
+        cleanup = threading.Thread(target=session.close, name="library-cleanup", daemon=False)
+        self.retired = [t for t in self.retired if t.is_alive()]
+        self.retired.append(cleanup)
+        cleanup.start()
+
+    def _activate(self, library: Path) -> None:
+        candidate = self._prepare(library)
+        try:
+            candidate.sampler.start()
+        except BaseException:
+            candidate.close()
+            raise
+        with self.lock:
+            previous = self.session
+            self.session = candidate
+            self.switch_error = None
+        if previous:
+            self._retire(previous)
 
     def start(self, library: Path) -> None:
-        with self.lock:
-            self._start_locked(Path(library))
-
-    def _start_locked(self, library: Path) -> None:
-        o = self.opts
-        self.history = History(o["history_for"](library))
-        self.snapshotter = None
-        if o["snapshot_mode"]:
-            scratch = Path(tempfile.mkdtemp(prefix="photodash-snap-"))
-            self.snapshotter = C.Snapshotter(library, scratch,
-                                             o["snapshot_interval"])
-            self.snapshotter.refresh(force=True)
-        self.sampler = Sampler(library, self.history, o["log_minutes"],
-                               o["log_interval"], o["walk_fs"], self.snapshotter)
-        self.sampler.start()
+        with self.control_lock:
+            if self.stopping:
+                raise RuntimeError("Dashboard is stopping")
+            self._activate(Path(library))
 
     def _check_readable(self, library: Path) -> bool:
-        """Verify we can read the library — without opening it in snapshot mode.
-
-        Opening a WAL store is exactly what writes its -shm, so in snapshot mode
-        the check is done against a throwaway copy instead. Copying is pure
-        reading, so the library itself is still never opened for a write.
-        """
         if not self.opts["snapshot_mode"]:
             return C.readable(library)
-        scratch = Path(tempfile.mkdtemp(prefix="photodash-check-"))
-        try:
-            probe = C.Snapshotter(library, scratch, interval=0)
-            if not probe.refresh(force=True):
-                return False
-            return C.readable(library, dbdir=probe.dir)
-        finally:
-            shutil.rmtree(scratch, ignore_errors=True)
-
-    def _stop_locked(self) -> None:
-        if self.sampler:
-            self.sampler.stop_event.set()
-            self.sampler.join(timeout=5)
-        if self.history:
-            self.history.close()
-        if self.snapshotter:
-            self.snapshotter.cleanup()
+        return (library / "database" / "Photos.sqlite").is_file()
 
     def switch(self, library: Path) -> dict:
         library = Path(library)
-        if not self._check_readable(library):
-            return {"ok": False, "error": f"cannot read {library}"}
-        with self.lock:
-            if self.sampler and self.sampler.library == library:
-                return {"ok": True, "library": str(library), "unchanged": True}
-            self._stop_locked()
-            self._start_locked(library)
+        with self.control_lock:
+            if self.stopping:
+                return {"ok": False, "error": "Dashboard is stopping"}
+            with self.lock:
+                if self.session and self.session.sampler.library == library:
+                    return {"ok": True, "library": str(library), "unchanged": True}
+            try:
+                if not self._check_readable(library):
+                    raise ValueError(f"cannot read {library}")
+                self._activate(library)
+            except Exception as exc:
+                # Preparation/start failure has not stopped the current sampler.
+                with self.lock:
+                    self.switch_error = str(exc)
+                return {"ok": False, "error": str(exc)}
         return {"ok": True, "library": str(library)}
 
     def discover(self) -> list[dict]:
-        # Shallow probe in snapshot mode: opening every candidate to test it
-        # would write each one's -shm, which is the thing snapshot mode exists
-        # to avoid.
+        # In snapshot mode, backup creation is the actual readability test.
         return C.discover_libraries(deep=not self.opts["snapshot_mode"])
 
     def snapshot(self) -> dict:
         with self.lock:
-            sampler = self.sampler
-        return sampler.snapshot() if sampler else {"status": "starting"}
+            state = self.session.sampler.snapshot() if self.session else {
+                "status": "stopping" if self.stopping else "starting"}
+            if self.switch_error:
+                state["switch_error"] = self.switch_error
+            return state
 
     def series(self, *a, **kw):
         with self.lock:
-            history = self.history
-        return history.series(*a, **kw) if history else {}
+            return self.session.history.series(*a, **kw) if self.session else {}
 
     def events(self, *a, **kw):
         with self.lock:
-            history = self.history
-        return history.events(*a, **kw) if history else []
+            return self.session.history.events(*a, **kw) if self.session else []
 
     def snapshot_history(self, *a, **kw):
         with self.lock:
-            history = self.history
-        return history.snapshot_history(*a, **kw) if history else []
+            return self.session.history.snapshot_history(*a, **kw) if self.session else []
 
     def shutdown(self) -> None:
-        with self.lock:
-            self._stop_locked()
+        with self.control_lock:
+            with self.lock:
+                self.stopping = True
+                current = self.session
+                self.session = None
+            if current:
+                self._retire(current)
+            cleanups = list(self.retired)
+        # A slow operation delays exit, not API access or resource ownership.
+        # A forced process termination can still leave scratch files behind.
+        for cleanup in cleanups:
+            while cleanup.is_alive():
+                try:
+                    cleanup.join(timeout=0.25)
+                except KeyboardInterrupt:
+                    print("Still waiting for library readers to stop before cleanup.")
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "PhotosDashboard/1.0"
     sup: Supervisor = None           # type: ignore[assignment]
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(5)
 
     def log_message(self, fmt, *args):
         pass                          # the access log is noise here
@@ -507,6 +610,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; "
+                         "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                         "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -517,7 +625,27 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(payload, default=str).encode(),
                    "application/json; charset=utf-8")
 
+    def _authorized(self) -> bool:
+        port = self.server.server_port
+        hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if port == 80:
+            hosts |= {"127.0.0.1", "localhost"}
+        host = self.headers.get("Host", "")
+        origin = self.headers.get("Origin")
+        site = self.headers.get("Sec-Fetch-Site")
+        allowed = (host in hosts and (origin is None or origin == f"http://{host}")
+                   and site not in ("cross-site", "same-site"))
+        if urlparse(self.path).path.startswith('/api/'):
+            supplied = self.headers.get("X-PhotosDashboard-Token", "")
+            allowed = allowed and secrets.compare_digest(
+                supplied.encode('utf-8'), self.server.api_token.encode('utf-8'))
+        if not allowed:
+            self._json({"error": "Forbidden"}, 403)
+        return allowed
+
     def do_GET(self) -> None:                                 # noqa: N802
+        if not self._authorized():
+            return
         url = urlparse(self.path)
         path, qs = url.path, parse_qs(url.query)
         try:
@@ -529,19 +657,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.sup.snapshot())
             if path == "/api/series":
                 metrics = [m for m in qs.get("metrics", [""])[0].split(",") if m]
-                window = float(qs.get("window", ["3600"])[0])
-                points = int(qs.get("points", ["600"])[0])
+                window = min(400 * 86400, max(1, float(qs.get("window", ["3600"])[0])))
+                points = min(2000, max(1, int(qs.get("points", ["600"])[0])))
+                metrics = metrics[:100]
                 return self._json({
                     "window": window,
                     "series": self.sup.series(metrics, window, points),
                 })
             if path == "/api/events":
                 return self._json({"events": self.sup.events(
-                    limit=int(qs.get("limit", ["200"])[0]))})
+                    limit=min(1000, max(1, int(qs.get("limit", ["200"])[0]))))})
             if path == "/api/snapshot-history":
                 name = qs.get("name", ["queue_mix"])[0]
                 return self._json({"name": name, "rows": self.sup.snapshot_history(
-                    name, limit=int(qs.get("limit", ["100"])[0]))})
+                    name, limit=min(1000, max(1, int(qs.get("limit", ["100"])[0]))))})
             if path == "/api/libraries":
                 current = self.sup.snapshot().get("identity", {}).get("path")
                 return self._json({
@@ -560,18 +689,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": str(exc)}, 500)
 
     def do_POST(self) -> None:                                # noqa: N802
+        if not self._authorized():
+            return
         url = urlparse(self.path)
         try:
             if url.path != "/api/select-library":
                 return self._json({"error": "not found", "path": url.path}, 404)
             length = int(self.headers.get("Content-Length") or 0)
+            if not 0 < length <= 16384 or self.headers.get_content_type() != "application/json":
+                return self._json({"error": "Expected a JSON body of at most 16 KiB"}, 400)
             body = json.loads(self.rfile.read(length) or b"{}")
             target = body.get("path")
             if not target:
                 return self._json({"error": "no path given"}, 400)
             # Only ever switch to a library discovery already found, so a POST
             # cannot be used to point the server at an arbitrary filesystem path.
-            known = {e["path"] for e in C.discover_libraries()}
+            known = {e["path"] for e in self.sup.discover()}
             if target not in known:
                 return self._json({"error": "not a discovered library"}, 400)
             result = self.sup.switch(Path(target))
@@ -582,17 +715,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def _static(self, name: str) -> None:
         target = (STATIC / name).resolve()
-        if not str(target).startswith(str(STATIC.resolve())) or not target.exists():
+        if not target.is_relative_to(STATIC.resolve()) or not target.is_file():
             return self._json({"error": "not found"}, 404)
         ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         if ctype.startswith("text/") or ctype.endswith(("javascript", "json")):
             ctype += "; charset=utf-8"
-        self._send(200, target.read_bytes(), ctype)
+        body = target.read_bytes()
+        if target == STATIC / "index.html":
+            body = body.replace(b"__DASHBOARD_TOKEN__", self.server.api_token.encode())
+        self._send(200, body, ctype)
 
 
 def serve(library: Path, history_for, host: str, port: int,
           log_minutes: int, log_interval: int, walk_fs: bool,
-          snapshot_mode: bool = False, snapshot_interval: float = 60.0) -> None:
+          snapshot_mode: bool = False, snapshot_interval: float = 300.0,
+          snapshot_dir: Path | None = None) -> None:
+    if host not in ("127.0.0.1", "localhost"):
+        raise ValueError("Only loopback HTTP access is supported")
     sup = Supervisor({
         "history_for": history_for,
         "log_minutes": log_minutes,
@@ -600,21 +739,29 @@ def serve(library: Path, history_for, host: str, port: int,
         "walk_fs": walk_fs,
         "snapshot_mode": snapshot_mode,
         "snapshot_interval": snapshot_interval,
+        "snapshot_dir": snapshot_dir,
     })
-    sup.start(library)
-    Handler.sup = sup
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    class BoundHandler(Handler):
+        pass
+    BoundHandler.sup = sup
+    httpd = ThreadingHTTPServer((host, port), BoundHandler)
+    httpd.api_token = secrets.token_urlsafe(32)
+    try:
+        sup.start(library)
+    except BaseException:
+        httpd.server_close()
+        sup.shutdown()
+        raise
     print(f"  library   {library}")
     print(f"  history   {history_for(library)}")
     if snapshot_mode:
-        s = sup.snapshotter
-        how = "APFS clone" if (s and s.cloned) else "copy"
+        how = "SQLite backup"
         print(f"  access    snapshot mode ({how}, refreshed every "
-              f"{snapshot_interval:.0f}s) — the library is only ever read")
+              f"{snapshot_interval:.0f}s) — source shared memory may be updated")
     else:
         print("  access    direct read-only — Photos.sqlite and its WAL are never")
         print("            written; SQLite may update the -shm WAL-index scratch")
-        print("            file. Use --snapshot-mode to avoid even that.")
+        print("            file, including when creating snapshot backups.")
         print(docs.cli("readonly"))
     print(f"  dashboard http://{host if host != '0.0.0.0' else 'localhost'}:{port}/")
     print("  Ctrl-C to stop")

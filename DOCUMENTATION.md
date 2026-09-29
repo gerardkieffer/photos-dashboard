@@ -56,7 +56,7 @@ chmod +x photo_dashboard.py test_readonly.py
 ```
 
 Optional but recommended before pointing it at a library you care about — this verifies
-the read-only guarantees on your own machine, against your own library:
+collector compatibility using a disposable backup of your library:
 
 ```bash
 python3 test_readonly.py
@@ -69,7 +69,7 @@ python3 photo_dashboard.py
 ```
 
 Then open <http://localhost:8787/>. The server binds to `127.0.0.1` only, so it is not
-reachable from other machines unless you deliberately pass `--host`.
+reachable from other machines. Non-loopback `--host` addresses are rejected.
 
 Stop it with `Ctrl-C`. History is kept, so restarting resumes the charts where they
 left off.
@@ -80,7 +80,7 @@ Useful variants:
 python3 photo_dashboard.py --list                    # which libraries can be read
 python3 photo_dashboard.py --library "/Volumes/Disk/X.photoslibrary"
 python3 photo_dashboard.py --port 9000
-python3 photo_dashboard.py --snapshot-mode           # never open the library at all
+python3 photo_dashboard.py --snapshot-mode           # query consistent database backups
 python3 photo_dashboard.py --once > report.json      # one pass, no server
 ```
 
@@ -125,7 +125,7 @@ This is the part that matters most, so it is enforced rather than promised.
 Every connection to a Photos database passes through all three:
 
 1. **`mode=ro` in the connection URI.** The operating system file handle is read-only.
-   SQLite cannot create or write `-wal`, `-shm` or journal files through it.
+   The source database and WAL are read-only; SQLite may update shared-memory files.
 2. **`PRAGMA query_only`.** The connection itself refuses any statement that would
    write, including one added by mistake in future code.
 3. **A SQLite authorizer.** A callback that runs *inside* SQLite as each statement is
@@ -133,7 +133,8 @@ Every connection to a Photos database passes through all three:
    `CREATE`, `DROP`, `ATTACH` and every pragma outside a small read-only whitelist are
    refused before the statement exists.
 
-All three would have to be removed deliberately for a write to become possible.
+These guards protect library connections. History uses a separate writable connection
+that rejects destinations inside libraries, hard links, and unrelated existing databases.
 
 Deliberately **not** used: SQLite's `immutable=1`, which is faster but promises that
 the file never changes. On a live library held by `photolibraryd` that promise is
@@ -141,79 +142,86 @@ false, and it would produce silently stale or torn reads.
 
 ### Verifying it yourself
 
-`test_readonly.py` is an executable test rather than a claim in a comment:
+Run synthetic regressions without opening a Photos library:
 
 ```bash
-python3 test_readonly.py
+python3 -m unittest -v test_safety test_review_regressions
+python3 test_docs.py
 ```
 
-It does three things:
+The tests cover rejected history destinations, database write guards, backups with WAL
+commits between every copy chunk, interrupted queries/copies, failed library switches,
+shutdown cleanup, consistent integrity checks, and HTTP access rules.
 
-1. **Enforcement** — issues a real `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP` and
-   two dangerous pragmas against your library and checks each is rejected, then checks
-   that ordinary reads still work.
-2. **Byte-for-byte** — clones your library's database files into a scratch bundle that
-   nothing else on the machine has open, SHA-256s every file, runs *every* collector,
-   and re-hashes. It compares content, size, modification time **and inode**, so even a
-   no-op rewrite or a replaced file would be caught. It runs this twice: once in direct
-   mode, once in snapshot mode.
-3. **No new files** — confirms no `-wal`, `-shm`, journal or lock file was created.
-
-Expected output ends with:
-
-```
-All checks passed: the dashboard reads and never writes.
-```
+Optionally run `python3 test_readonly.py --library PATH` for collector compatibility.
+It first creates a consistent read-only backup, without an extra source readability
+probe, then runs all attempted writes against disposable copies only. The collector
+checks convert those copies to WAL mode and keep committed WAL frames present while
+comparing database/WAL contents before and after collection, in both access modes.
+The fixture connections do not commit during these byte comparisons; concurrent
+commits are tested separately. This is a regression check, not an unconditional proof.
 
 ### The one honest caveat
 
-In direct mode, `Photos.sqlite` and its `-wal` come out **byte-identical** — that is
-what the test asserts. But SQLite does update the `-shm` file.
-
-The `-shm` is the *WAL index*: a derived scratch file that holds no library data, is
-regenerated from the WAL whenever it is missing, and that every reader of a
-write-ahead-logged database updates with its read mark — Photos itself included, and
-any `sqlite3` command you have ever run against such a file. It is normal and safe.
-
-It is not, however, the same thing as "untouched". If you want the stronger guarantee,
-use snapshot mode.
+SQLite readers, including backup readers in snapshot mode, can create or update the
+`-shm` WAL index. The source database and WAL are opened read-only. Read-only does not
+mean no locks, no shared-memory writes, or no disk load. For zero access to the original
+library, use an independent offline copy and keep a verified backup of your photos.
 
 ### What else the tool touches
 
-Outside the library bundle only:
+- History under `snapshots/dashboard/`, or a validated `--history` destination.
+- Snapshot databases in a private temporary directory, removed on normal shutdown.
+- Read-only subprocesses: `log show`, `lsof`, `pgrep`, and `defaults read`.
 
-- the history file under `snapshots/dashboard/` (see [Stored history](#stored-history));
-- in snapshot mode, a scratch copy in the system temporary directory, deleted on exit;
-- subprocesses: `log show`, `lsof`, `pgrep`, `defaults read`, and `cp` in snapshot mode.
-
-It never moves, renames, deletes or writes anything in `originals/`, `resources/` or
-anywhere else inside a `.photoslibrary` bundle.
+It does not move, rename, delete or write original photos or media resources.
 
 ## Snapshot mode
 
 ```bash
-python3 photo_dashboard.py --snapshot-mode
+python3 photo_dashboard.py --snapshot-mode --no-fs-walk
 ```
 
-Copies `Photos.sqlite`, `-wal` and `-shm` (and the search index) aside and reads the
-copy, so **not one byte inside the library bundle is written** — including the `-shm`.
-The library is only ever read, and copying is pure reading.
+SQLite's backup API creates a consistent copy of each database while coordinating with
+live writers. Main and search databases are individually consistent, not an atomic
+cross-database snapshot. The source connections are read-only but may update `-shm`.
+Raw copying of separate database/WAL files while Photos is active is not used.
 
-Getting this right required care: the readability probe and library discovery both used
-to open the library to test it, and a *successful open* is exactly what updates the
-`-shm`. In snapshot mode both go through the copy instead, and discovery falls back to
-a permission check rather than an open.
+Each backup holds an explicit source read transaction across small copy chunks, so
+commits by other connections do not repeatedly restart the copy. WAL writers can keep
+committing, but the retained read view can delay checkpoints and grow the source WAL.
+On a database using rollback journaling, the read transaction can delay writer commits.
 
-**Cost.** All three files are copied together — copying `Photos.sqlite` alone silently
-loses everything still in the WAL, which can be megabytes of recent edits (§2.4). Where
-the scratch directory is on the same APFS volume as the library, `cp -c` makes a clone
-instead: blocks are shared, nothing is duplicated, and it is effectively free. A 1 GB
-library "copies" in less than a second using nearly no extra space. On a different
-volume it is a real copy and correspondingly slower.
+A new generation is published only after both backups succeed. Failed attempts leave
+the previous generation intact and display an error. Before the first successful
+backup, the dashboard reports starting or unavailable. The sampler performs backups
+asynchronously, so the first copy does not hold the API lock. Backup attempts have a
+120-second cooperative budget checked between chunks, including cancellation checks.
+These checks cannot interrupt a stalled filesystem call. After an attempt ends, the
+next attempt waits the configured interval, including after failure.
 
-**Freshness.** Live metrics are only as current as `--snapshot-interval` (default 60 s),
-so the queue chart becomes minute-resolution rather than ten-second. The header badge
-shows which mode is active.
+**Cost.** These are full database copies, not APFS clones. Photo and video originals
+are not copied. Every successful refresh rewrites both databases in full, even if
+unchanged; failed attempts can also write substantial partial copies before cleanup.
+Budget disk space for two generations of the main and search databases, plus possible
+source WAL growth. A slowly retiring library can temporarily retain its own generation
+while a newly selected library starts.
+`--snapshot-dir /existing/scratch/parent` selects a location outside any library;
+the default is the system temporary directory. Normal shutdown cancels work and waits
+for readers to finish before removing scratch data; a stalled disk can delay exit.
+Crashes or forced termination may require manual removal of `photodash-snap-*`
+directories after the dashboard has stopped.
+
+**Freshness.** `--snapshot-interval` defaults to 300 seconds (five minutes).
+It applies to attempts, including failures. `--snapshot-mode --once` also uses a backup.
+Discovery in snapshot mode only lists candidate libraries; backup creation determines
+whether access is actually permitted.
+
+**Large libraries.** Use `--no-fs-walk` to omit the file inventory. When enabled, the
+inventory runs on a separate worker at startup and every six hours. Database SELECTs
+have a 15-second execution budget; lock waits are bounded separately. These limits
+cannot interrupt a stalled filesystem call. Database size and asset/file counts matter
+more than total original-media bytes; this has not been benchmarked on a 1.5 TB library.
 
 ## Reading the dashboard
 
@@ -272,6 +280,10 @@ instead. `ZASSETANALYSISSTATE`, the table that sounds like it should answer this
 empty in every library measured. But `ZMEDIAANALYSISASSETATTRIBUTES` has one row per
 asset and one version column per analysis worker, left at zero until that worker has
 processed the asset. A version greater than zero is direct evidence of completed work.
+Video workers show recorded counts without a percentage because their eligible asset
+population is not established. Workers with zero recorded versions show "no recorded
+analysis"; this does not establish whether the worker is applicable or stalled.
+In JSON, those percentages are `null`, and video-worker totals are also `null`.
 
 ## Sampling tiers
 
@@ -324,19 +336,24 @@ photodash/
   server.py                 sampler thread, supervisor, JSON API, static files
   docs.py                   the table of documentation pointers used by messages
   static/                   index.html, app.js, glossary.js, style.css
-test_readonly.py            executable proof that nothing is written
+test_readonly.py            optional collector checks on disposable copies
+test_safety.py              synthetic safety regressions (no Photos library needed)
+test_review_regressions.py  concurrent backup, cancellation, lifecycle and recovery tests
 ```
 
-**The sampler owns all reading.** HTTP handlers never touch the library: they serve the
-last completed sample out of memory and the history out of SQLite. A slow `log show` or
-a spun-down external disk therefore cannot make the page hang.
+**The sampler owns metric collection.** Snapshot and chart requests serve completed
+samples and history. Library discovery and selection can inspect library paths and
+may wait for disk access.
 
 **Expensive collectors run on their own threads.** The unified-log read takes seconds to
-tens of seconds, so it never delays the ten-second queue sample behind it.
+tens of seconds, and filesystem inventory can be slow; each has its own worker.
+Shutdown and switching retain resources until workers have stopped.
 
-**A supervisor owns the current sampler**, so switching library swaps the sampler, the
-history file and the snapshot directory together under one lock. An HTTP request can
-never observe a half-switched state.
+**A supervisor owns the current sampler.** It prepares replacement resources outside
+the API lock and atomically publishes the new session. Preparation/start failures leave
+the previous session running and report a switch error. Old sessions retire in the
+background; cleanup waits for all their workers. A newly selected snapshot library whose
+first backup fails reports unavailable rather than a successful empty sample.
 
 ### Rules the collectors follow
 
@@ -362,20 +379,26 @@ correct numbers and confidently wrong ones:
 |---|---|---|
 | `--library PATH` | auto | The `.photoslibrary` bundle to watch |
 | `--port N` | `8787` | HTTP port |
-| `--host ADDR` | `127.0.0.1` | Bind address. Localhost only by default |
+| `--host ADDR` | `127.0.0.1` | Only `127.0.0.1` or `localhost` accepted |
 | `--history PATH` | per library | Time-series store location |
 | `--log-minutes N` | `5` | Window each `log show` query covers |
 | `--log-interval N` | `180` | Seconds between unified-log passes |
 | `--no-fs-walk` | off | Skip the filesystem inventory |
-| `--snapshot-mode` | off | Read a copy; never open the library |
-| `--snapshot-interval N` | `60` | Seconds between snapshot refreshes |
+| `--snapshot-mode` | off | Query consistent SQLite backups; source shared memory may change |
+| `--snapshot-interval N` | `300` | Seconds between snapshot attempts |
+| `--snapshot-dir PATH` | system temp | Existing scratch parent outside any library |
 | `--list` | — | List libraries and whether each is readable |
 | `--once` | — | Run every collector once, print JSON, exit |
 
 ## HTTP API
 
-All responses are JSON. Everything is served from memory or the history file, so no
-endpoint blocks on the library.
+API responses are JSON. Requests require the per-run `X-PhotosDashboard-Token` header;
+the browser reads the token from the dashboard page and supplies it automatically.
+Host must match localhost or 127.0.0.1 on the bound port. Cross-origin/browser cross-site
+requests are rejected, and POST requires JSON with a body no larger than 16 KiB.
+The service is loopback-only, without TLS or remote-user authentication. Do not expose
+it through proxies or tunnels. Processes running as your user can still access it.
+Chart/snapshot endpoints use cached data; library discovery/selection may access disk.
 
 | Endpoint | Purpose |
 |---|---|

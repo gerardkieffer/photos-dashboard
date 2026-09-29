@@ -2,15 +2,16 @@
 
 Every function here is safe to run against a live library, including one that
 Photos.app and the analysis daemons currently hold open. Read-only is enforced
-three ways (see the `connections` section below), and test_readonly.py proves
-byte-for-byte that `Photos.sqlite` and its WAL are never modified.
+three ways (see the `connections` section below). test_readonly.py checks
+collector behavior byte-for-byte on disposable library copies.
 
 One honest caveat, measured rather than assumed: opening a WAL database — even
 read-only — lets SQLite update the `-shm` WAL-index, the derived scratch file
 that carries reader marks and no library data. Every WAL reader does this,
 Photos included, and the file is regenerated from the WAL whenever it is
-missing. `Snapshotter` (snapshot mode) exists for anyone who wants the stronger
-guarantee that not one byte inside the bundle is written.
+missing. `Snapshotter` (snapshot mode) provides the
+option of running expensive queries on a consistent local backup. Backup
+coordination can also update the source shared-memory file.
 
 See APPLE-PHOTOS-LIBRARY-INTERNALS.md for why each query is shaped the way it
 is — the section references in the comments below are to that document.
@@ -37,12 +38,15 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
+from contextlib import contextmanager
 import threading
 import time
 from collections import Counter
 from pathlib import Path
 
 from . import coredata as ph
+from .safety import outside_library
 
 APPLE_EPOCH = ph.APPLE_EPOCH
 LOG = "/usr/bin/log"          # §20: bare `log` hits a zsh builtin
@@ -60,8 +64,22 @@ def decompose_flags(flags: int) -> list[int]:
     return [1 << i for i in range(32) if flags & (1 << i)]
 
 
-def sh(cmd: list[str], timeout: int = 120) -> str:
+def sh(cmd: list[str], timeout: int = 120, stop_event=None) -> str:
     try:
+        if stop_event is not None:
+            if stop_event.is_set():
+                return ""
+            with subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) as proc:
+                deadline = time.monotonic() + timeout
+                while not stop_event.is_set() and time.monotonic() < deadline:
+                    try:
+                        return proc.communicate(timeout=0.25)[0]
+                    except subprocess.TimeoutExpired:
+                        continue
+                proc.kill()
+                proc.communicate()
+                return ""
         return subprocess.run(cmd, capture_output=True, text=True,
                               timeout=timeout).stdout
     except Exception:                                        # noqa: BLE001
@@ -89,7 +107,7 @@ def unix_to_apple(v: float) -> float:
 # library discovery
 # --------------------------------------------------------------------------
 def _probe(db: Path) -> bool:
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+    con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
     try:
         _harden(con)
         con.execute("SELECT Z_ENT FROM Z_PRIMARYKEY LIMIT 1").fetchone()
@@ -112,9 +130,9 @@ def readable(lib: Path, timeout: float = 4.0, dbdir: Path | None = None) -> bool
     external volume behaves the same way. Neither may be allowed to wedge the
     server on startup, so an unanswered probe counts as not readable.
 
-    `dbdir` points the probe at a snapshot copy instead of the library, so that
-    snapshot mode never opens the library even to check it can be opened —
-    a successful open is exactly what updates the -shm.
+    `dbdir` points the probe at a snapshot copy instead of the library, when checking
+    a completed backup. Backup creation itself opens the source read-only and
+    can update its shared-memory file.
     """
     try:
         if not (lib / "database" / "Photos.sqlite").exists():
@@ -143,8 +161,8 @@ def discover_libraries(deep: bool = True) -> list[dict]:
     `deep=False` decides readability from file permissions instead of opening
     the store. It is less certain — TCC lets stat() through, so a blocked
     library can look readable — but opening a WAL database is precisely what
-    updates its -shm, so snapshot mode uses the shallow probe to keep its
-    promise that the library is never written.
+    updates its -shm, so snapshot mode uses a shallow probe and defers actual
+    readability to backup creation.
     """
     seen: dict[str, dict] = {}
     roots = [ph.PROJECT_DIR, ph.PROJECT_DIR.parent, Path.home() / "Pictures"]
@@ -191,7 +209,7 @@ def discover_libraries(deep: bool = True) -> list[dict]:
 # read-only is enforced three independent ways rather than trusted once:
 #
 #   1. the URI opens the file with mode=ro, so the OS file handle is read-only
-#      and SQLite will not create or write -wal / -shm / journal files;
+#      the database and WAL remain read-only (the -shm may be updated);
 #   2. PRAGMA query_only makes the *connection* refuse any statement that would
 #      write, even one issued by mistake in code added later;
 #   3. an authorizer whitelists the operations a reader needs and denies every
@@ -224,8 +242,11 @@ _ALLOWED_ACTIONS = {
 def _readonly_authorizer(action, arg1, arg2, db_name, trigger):
     """Deny anything that is not a read. Runs inside SQLite at compile time."""
     if action == sqlite3.SQLITE_PRAGMA:
-        return sqlite3.SQLITE_OK if (arg1 or "").lower() in _READ_PRAGMAS \
-               else sqlite3.SQLITE_DENY
+        name = (arg1 or "").lower()
+        arguments = {"table_info", "table_xinfo", "index_list", "index_info",
+                     "index_xinfo", "foreign_key_list"}
+        return sqlite3.SQLITE_OK if name in _READ_PRAGMAS and (
+            arg2 is None or name in arguments) else sqlite3.SQLITE_DENY
     return sqlite3.SQLITE_OK if action in _ALLOWED_ACTIONS else sqlite3.SQLITE_DENY
 
 
@@ -236,15 +257,33 @@ def _harden(con: sqlite3.Connection) -> sqlite3.Connection:
     return con
 
 
-def open_db(lib: Path, dbdir: Path | None = None) -> sqlite3.Connection:
-    """`dbdir` overrides where the database files are read from (snapshot mode)."""
-    db = (dbdir or (lib / "database")) / "Photos.sqlite"
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+class ReadConnection(sqlite3.Connection):
+    """Bound each SELECT's execution time, including cursor iteration."""
+
+    query_timeout = 15.0
+    stop_event = None
+
+    def execute(self, sql, parameters=()):
+        deadline = time.monotonic() + self.query_timeout
+        self.set_progress_handler(lambda: int(
+            time.monotonic() >= deadline or
+            (self.stop_event is not None and self.stop_event.is_set())), 1000)
+        return super().execute(sql, parameters)
+
+
+def open_readonly(db: Path, query_timeout: float = 15.0,
+                  stop_event=None) -> sqlite3.Connection:
+    con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True,
+                          timeout=2, factory=ReadConnection)
+    con.query_timeout = query_timeout
+    con.stop_event = stop_event
     _harden(con)
-    # Registered after the authorizer so the call is authorised as a FUNCTION,
-    # not smuggled in as something else. §16: NFC comparison inside SQL.
     ph.register_nfc(con)
     return con
+
+
+def open_db(lib: Path, dbdir: Path | None = None, **kwargs) -> sqlite3.Connection:
+    return open_readonly((dbdir or (lib / "database")) / "Photos.sqlite", **kwargs)
 
 
 def open_psi(lib: Path, dbdir: Path | None = None) -> sqlite3.Connection | None:
@@ -252,10 +291,23 @@ def open_psi(lib: Path, dbdir: Path | None = None) -> sqlite3.Connection | None:
     if not psi.exists():
         return None
     try:
-        con = sqlite3.connect(f"file:{psi}?mode=ro", uri=True, timeout=5)
-        return _harden(con)
-    except sqlite3.Error:
+        return open_readonly(psi)
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         return None
+
+
+@contextmanager
+def read_transaction(con):
+    """Use one SQLite view for a multi-query integrity check."""
+    owned = not con.in_transaction
+    if owned:
+        con.execute("BEGIN")
+    try:
+        yield
+    finally:
+        if owned:
+            con.rollback()
 
 
 # --------------------------------------------------------------------------
@@ -266,102 +318,117 @@ PSI_FILES = ["psi.sqlite", "psi.sqlite-wal", "psi.sqlite-shm"]
 
 
 class Snapshotter:
-    """Copies the database files aside so the library is never opened at all.
+    """Publish complete SQLite backups; failed refreshes retain the last copy.
 
-    Why this exists: `mode=ro` keeps SQLite from changing `Photos.sqlite` or its
-    WAL — that is verified byte-for-byte by test_readonly.py — but it does not
-    stop SQLite writing the `-shm` file. The `-shm` is the WAL-index: a derived
-    scratch file holding no library data, which every WAL reader must update
-    with its read-mark, Photos itself included. It is regenerated from the WAL
-    whenever it is missing.
-
-    That is normal and safe, and it is what plain `sqlite3` does. But "safe" is
-    not "untouched", so snapshot mode exists for anyone who wants the stronger
-    guarantee: the library is only ever read, byte by byte, and every SQLite
-    write lands on the copy.
-
-    The cost is freshness and time — the copy is the size of the store. Where
-    the scratch directory is on the same APFS volume as the library, `cp -c`
-    clones the files instead, which shares blocks and is effectively free
-    (§15.2); otherwise it falls back to a normal copy.
-
-    §2.4: copy `Photos.sqlite`, `-wal` and `-shm` together. Copying the database
-    alone silently loses everything still in the WAL, which can be megabytes of
-    recent edits.
+    The source is opened mode=ro, so its database and WAL are not written.
+    SQLite may update the source -shm while coordinating with live writers.
+    The two databases are individually consistent, not a cross-database
+    transaction. For zero access to the original, use an offline library copy.
     """
 
-    def __init__(self, library: Path, scratch: Path, interval: float = 60.0):
+    def __init__(self, library: Path, scratch: Path, interval: float = 300.0,
+                 timeout: float = 120.0):
         self.library = Path(library)
-        self.dir = Path(scratch)
+        self.root = outside_library(scratch, library)
+        self.root.mkdir(parents=True, exist_ok=True)
+        if any(self.root.iterdir()):
+            raise ValueError("Snapshot scratch directory must be empty")
+        self.dir = self.root / "unavailable"
         self.interval = interval
+        self.timeout = timeout
+        self.stop_event = threading.Event()
         self.last_copy = 0.0
+        self.last_attempt = 0.0
         self.last_duration = 0.0
-        self.cloned = False
         self.error: str | None = None
-        self.dir.mkdir(parents=True, exist_ok=True)
-        (self.dir / "search").mkdir(exist_ok=True)
 
-    def _copy(self, src: Path, dst: Path) -> None:
-        if dst.exists():
-            dst.unlink()
-        # -c asks for an APFS clone: no data copied, no extra space used. It
-        # fails on a cross-volume or non-APFS target, hence the fallback.
-        r = subprocess.run(["cp", "-c", str(src), str(dst)],
-                           capture_output=True, text=True)
-        if r.returncode == 0:
-            self.cloned = True
-            return
-        self.cloned = False
-        shutil.copy2(src, dst)
+    def _backup(self, src: Path, dst: Path, deadline: float) -> None:
+        def progress(status, remaining, total):
+            if self.stop_event.is_set() or time.monotonic() >= deadline:
+                raise TimeoutError("Snapshot backup cancelled or exceeded its time budget")
+        source = open_readonly(src)
+        try:
+            target = sqlite3.connect(dst)
+            try:
+                # Pin one read view across steps. Without this, commits on
+                # another connection restart a chunked backup indefinitely.
+                # WAL writers can continue; checkpoints must retain this view.
+                with read_transaction(source):
+                    source.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+                    progress(sqlite3.SQLITE_OK, 0, 0)
+                    source.backup(target, pages=256, progress=progress, sleep=0.05)
+                target.execute("PRAGMA journal_mode=DELETE")
+            finally:
+                target.close()
+        finally:
+            source.close()
 
     def refresh(self, force: bool = False) -> bool:
-        """Re-copy if the snapshot has aged out. Returns True if it copied."""
-        if not force and (time.time() - self.last_copy) < self.interval:
+        if not force and time.monotonic() - self.last_attempt < self.interval:
             return False
-        t0 = time.time()
+        self.last_attempt = time.monotonic()
+        t0 = time.monotonic()
+        stage = None
+        published = False
         try:
-            for name in DB_FILES:
-                src = self.library / "database" / name
-                dst = self.dir / name
-                if src.exists():
-                    self._copy(src, dst)
-                elif dst.exists():
-                    dst.unlink()
-            for name in PSI_FILES:
-                src = self.library / "database" / "search" / name
-                dst = self.dir / "search" / name
-                if src.exists():
-                    self._copy(src, dst)
-                elif dst.exists():
-                    dst.unlink()
+            stage = Path(tempfile.mkdtemp(prefix="generation-", dir=self.root))
+            deadline = t0 + self.timeout
+            self._backup(self.library / "database" / "Photos.sqlite",
+                         stage / "Photos.sqlite", deadline)
+            psi = self.library / "database" / "search" / "psi.sqlite"
+            if psi.exists():
+                (stage / "search").mkdir()
+                self._backup(psi, stage / "search" / "psi.sqlite", deadline)
+            previous = self.dir
+            self.dir = stage
+            published = True
+            self.last_copy = time.time()
+            self.last_duration = time.monotonic() - t0
             self.error = None
-        except OSError as exc:
+            if previous.exists():
+                shutil.rmtree(previous, ignore_errors=True)
+            return True
+        except (OSError, sqlite3.Error) as exc:
             self.error = str(exc)
             return False
-        self.last_copy = time.time()
-        self.last_duration = self.last_copy - t0
-        return True
+        finally:
+            # Covers KeyboardInterrupt and unexpected failures as well as
+            # ordinary I/O errors. Never remove the published generation.
+            if stage is not None and not published:
+                shutil.rmtree(stage, ignore_errors=True)
+            # Wait a full interval after completion/failure, even when the
+            # attempt itself took longer than the configured interval.
+            self.last_attempt = time.monotonic()
 
     def status(self) -> dict:
         return {
-            "mode": "snapshot",
-            "dir": str(self.dir),
-            "interval_s": self.interval,
-            "last_copy": self.last_copy or None,
+            "mode": "snapshot", "dir": str(self.dir),
+            "interval_s": self.interval, "last_copy": self.last_copy or None,
             "last_duration_s": round(self.last_duration, 3),
-            "apfs_clone": self.cloned,
-            "error": self.error,
+            "apfs_clone": False, "error": self.error,
+            "note": "Consistent SQLite backups; source shared-memory files may be updated.",
         }
 
     def cleanup(self) -> None:
-        shutil.rmtree(self.dir, ignore_errors=True)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+def raise_if_interrupted(exc: sqlite3.Error) -> None:
+    """Cancellation is missing data, never an empty successful result.
+
+    Python 3.10 does not expose sqlite_errorcode on exceptions.
+    """
+    if (getattr(exc, "sqlite_errorcode", None) == 9 or
+            (isinstance(exc, sqlite3.OperationalError) and str(exc) == "interrupted")):
+        raise exc
 
 
 def scalar(con, sql: str, *args, default=None):
     try:
         row = con.execute(sql, args).fetchone()
         return row[0] if row and row[0] is not None else default
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         return default
 
 
@@ -471,7 +538,8 @@ def collect_queue_mix(con) -> dict:
                     "older": r["n"] - (r["lt_7d"] or 0),
                 },
             })
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         pass
 
     # Non-UUID identifiers are the named, enumerable jobs — worth listing.
@@ -483,7 +551,8 @@ def collect_queue_mix(con) -> dict:
                '[0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]-*-*-*-*'
              GROUP BY 1 ORDER BY n DESC LIMIT 25"""):
             named.append({"identifier": r["id"], "count": r["n"]})
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         pass
     return {"buckets": rows, "named_identifiers": named}
 
@@ -520,7 +589,8 @@ def collect_queue_hot_assets(con, limit: int = 20) -> list[dict]:
                     o["kind"] = "video" if m["ZKIND"] == 1 else "photo"
                     o["dimensions"] = f'{m["ZWIDTH"]}x{m["ZHEIGHT"]}'
                     o["created"] = apple_to_unix(m["ZDATECREATED"])
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         pass
     return out
 
@@ -570,7 +640,8 @@ def collect_authors(con, window_s: int = 3600, limit: int = 15) -> list[dict]:
              GROUP BY 1 ORDER BY n DESC LIMIT ?""", (since, limit)):
             out.append({"name": r["name"], "count": r["n"],
                         "last_ts": apple_to_unix(r["last"])})
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         pass
     return out
 
@@ -598,7 +669,8 @@ def collect_recent_changes(con, window_s: int = 3600) -> list[dict]:
                 "change": {0: "insert", 1: "update"}.get(r["ct"], f"type {r['ct']}"),
                 "count": r["n"],
             })
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         pass
     return out
 
@@ -673,7 +745,8 @@ def collect_top_people(con, limit: int = 12) -> list[dict]:
              WHERE TRIM(COALESCE(ZFULLNAME,'')) <> ''
              ORDER BY ZFACECOUNT DESC LIMIT ?""", (limit,)):
             out.append({"name": r["name"], "faces": r["n"]})
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         pass
     return out
 
@@ -742,7 +815,8 @@ def collect_top_keywords(con, limit: int = 15) -> list[dict]:
              WHERE k.ZTITLE IS NOT NULL
              GROUP BY 1 ORDER BY n DESC LIMIT ?""", (limit,)):
             out.append({"keyword": ph.nfc(r["t"]), "assets": r["n"]})
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         pass
     return out
 
@@ -772,7 +846,8 @@ def collect_resources(con) -> dict:
             "SELECT ZRESOURCETYPE t, COUNT(*) n, SUM(ZDATALENGTH) b "
             "FROM ZINTERNALRESOURCE GROUP BY 1 ORDER BY n DESC"):
             by_type.append({"type": r["t"], "count": r["n"], "bytes": r["b"] or 0})
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         pass
     out["by_type"] = by_type
     return out
@@ -790,7 +865,8 @@ def collect_analysis_coverage(con) -> dict:
     try:
         cols = [r["name"] for r in con.execute(
             "PRAGMA table_info(ZMEDIAANALYSISASSETATTRIBUTES)")]
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         return {}
     vcols = [c for c in cols if c.endswith("VERSION")]
     if not vcols:
@@ -799,16 +875,21 @@ def collect_analysis_coverage(con) -> dict:
     try:
         row = con.execute(
             f"SELECT COUNT(*), {sel} FROM ZMEDIAANALYSISASSETATTRIBUTES").fetchone()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         return {}
     total = row[0] or 0
     workers = []
     for c, done in zip(vcols, row[1:]):
         label = c[1:-len("VERSION")].title()             # ZVISUALSEARCHVERSION -> Visualsearch
+        # Eligibility for video workers is not established (e.g. Live Photos).
+        # All assets would be a misleading completion denominator.
+        denominator = None if c.startswith("ZVIDEO") else total
         workers.append({"column": c, "label": label, "done": done or 0,
-                        "total": total,
-                        "pct": (100.0 * (done or 0) / total) if total else 0.0})
-    workers.sort(key=lambda w: w["pct"])
+                        "total": denominator,
+                        "pct": (100.0 * done / denominator)
+                        if done and denominator else None})
+    workers.sort(key=lambda w: w["done"])
     return {"total": total, "workers": workers}
 
 
@@ -832,6 +913,11 @@ def collect_analysis_side_tables(con) -> dict:
 # tier: slow — integrity (§3.2)
 # --------------------------------------------------------------------------
 def collect_pk_health(con) -> dict:
+    with read_transaction(con):
+        return _collect_pk_health(con)
+
+
+def _collect_pk_health(con) -> dict:
     """Compare MAX(Z_PK) against Z_PRIMARYKEY.Z_MAX for every entity.
 
     §3.2: a table whose highest row exceeds its counter means the next save
@@ -845,7 +931,8 @@ def collect_pk_health(con) -> dict:
             "SELECT Z_NAME, Z_ENT, Z_MAX FROM Z_PRIMARYKEY").fetchall()
         tables = {r["name"].upper() for r in con.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         return {"checked": 0, "faults": [], "ok": None}
 
     for e in entries:
@@ -869,15 +956,17 @@ def collect_table_census(con, limit: int = 60) -> list[dict]:
     """Row counts for the tables worth watching, plus their Z_MAX."""
     zmax = {}
     try:
-        zmax = {r["Z_NAME"]: r["Z_MAX"] for r in
+        zmax = {r["Z_NAME"].upper(): r["Z_MAX"] for r in
                 con.execute("SELECT Z_NAME, Z_MAX FROM Z_PRIMARYKEY")}
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         pass
     try:
         names = [r["name"] for r in con.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND (name LIKE 'Z%' OR name LIKE 'A%') ORDER BY name")]
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         return []
     out = []
     for t in names:
@@ -887,7 +976,7 @@ def collect_table_census(con, limit: int = 60) -> list[dict]:
         if n is None:
             continue
         entity = t[1:] if t.startswith(("Z", "A")) else t
-        out.append({"table": t, "rows": n, "z_max": zmax.get(entity)})
+        out.append({"table": t, "rows": n, "z_max": zmax.get(entity.upper())})
     out.sort(key=lambda r: -r["rows"])
     return out[:limit]
 
@@ -954,6 +1043,7 @@ def collect_search_index(lib: Path, con, dbdir: Path | None = None) -> dict:
         out["keywords_missing"] = missing[:40]
         out["keywords_missing_count"] = len(missing)
     except sqlite3.Error as exc:
+        raise_if_interrupted(exc)
         out["error"] = str(exc)
     finally:
         psi.close()
@@ -1010,7 +1100,7 @@ DECISION_RE = re.compile(r"Decision: ([A-Z]+)")
 POLICY_RE = re.compile(r"name: ([A-Za-z ]+Policy), policyWeight: ([0-9.]+)")
 
 
-def collect_log(minutes: int = 5) -> dict:
+def collect_log(minutes: int = 5, stop_event=None) -> dict:
     """Scheduler verdicts and save errors from the unified log.
 
     §2.5: whether analysis is *allowed* to run is recorded nowhere on disk —
@@ -1025,7 +1115,7 @@ def collect_log(minutes: int = 5) -> dict:
 
     dec = sh([LOG, "show", "--last", f"{minutes}m", "--predicate",
               'eventMessage CONTAINS "mediaanalysisd.photos"', "--style", "compact"],
-             timeout=180)
+             timeout=180, stop_event=stop_event)
     verdicts = Counter(DECISION_RE.findall(dec))
     out["decisions"] = dict(verdicts)
     out["decisions_total"] = sum(verdicts.values())
@@ -1044,7 +1134,7 @@ def collect_log(minutes: int = 5) -> dict:
 
     txt = sh([LOG, "show", "--last", f"{minutes}m", "--predicate",
               'process IN {"Photos","photolibraryd","mediaanalysisd","photoanalysisd"}',
-              "--style", "compact"], timeout=180)
+              "--style", "compact"], timeout=180, stop_event=stop_event)
     out["log_lines"] = txt.count("\n")
     # §20.2: this exact string (Apple's own spelling) is the signature of a
     # primary-key counter that has fallen behind.
@@ -1071,7 +1161,7 @@ def collect_log(minutes: int = 5) -> dict:
 # --------------------------------------------------------------------------
 # tier: rare — filesystem inventory
 # --------------------------------------------------------------------------
-def collect_filesystem(lib: Path) -> dict:
+def collect_filesystem(lib: Path, stop_event=None) -> dict:
     """Walk the bundle. Expensive (tens of thousands of files), hence 'rare'."""
     out: dict = {"collected_at": time.time()}
     try:
@@ -1081,6 +1171,10 @@ def collect_filesystem(lib: Path) -> dict:
     except OSError:
         pass
 
+    def cancelled():
+        if stop_event is not None and stop_event.is_set():
+            raise InterruptedError("Filesystem inventory cancelled")
+
     dirs = {}
     for sub in ("originals", "resources/derivatives", "resources/renders",
                 "database", "resources/cpl", "private", "scopes"):
@@ -1088,10 +1182,12 @@ def collect_filesystem(lib: Path) -> dict:
         n = total = 0
         if root.exists():
             for dirpath, dirnames, filenames in os.walk(root):
+                cancelled()
                 # §1: digiKam creates originals/.dtrash and moves files there.
                 # A naive walk counts them as library content; prune dot-dirs.
                 dirnames[:] = [d for d in dirnames if not d.startswith(".")]
                 for f in filenames:
+                    cancelled()
                     try:
                         total += os.stat(os.path.join(dirpath, f)).st_size
                         n += 1
@@ -1106,7 +1202,9 @@ def collect_filesystem(lib: Path) -> dict:
     if dtrash.exists():
         n = total = 0
         for dirpath, _, filenames in os.walk(dtrash):
+            cancelled()
             for f in filenames:
+                cancelled()
                 try:
                     total += os.stat(os.path.join(dirpath, f)).st_size
                     n += 1
@@ -1120,8 +1218,10 @@ def collect_filesystem(lib: Path) -> dict:
     assets = companions = 0
     if originals.exists():
         for dirpath, dirnames, filenames in os.walk(originals):
+            cancelled()
             dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             for f in filenames:
+                cancelled()
                 if ph.uuid_from_name(f):
                     assets += 1
                 elif re.match(r"^[0-9A-F-]{36}_\d+\.", f, re.I):
